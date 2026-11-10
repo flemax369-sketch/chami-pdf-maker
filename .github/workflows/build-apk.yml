@@ -17,8 +17,14 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # No setup-android step: ubuntu-latest already has the Android SDK
+      # preinstalled. setup-android@v3 tries to install the obsolete
+      # 'tools' package and fails with sdkmanager exit code 1.
+      - name: Check Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/platforms" || true
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v3
