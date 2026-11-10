@@ -33,13 +33,17 @@ jobs:
 
       # The source code is in the ZIP uploaded to the repo root.
       # Unzip it in place, dropping AI Studio-only folders.
+      # Use cp -a unzipped/. . so hidden files like .env.example
+      # are copied too - cp unzipped/* . skips dotfiles, and the
+      # Secrets Gradle Plugin then fails with .env.example not found.
       - name: Unzip source
         run: |
           unzip -o chami---img-to-pdf.zip -x ".aistudio/*" "public/*" -d unzipped
-          cp -r unzipped/* .
+          cp -a unzipped/. .
           rm -rf unzipped
           ls -la
           test -f app/build.gradle.kts
+          test -f .env.example
 
       - name: Generate debug keystore
         run: |
