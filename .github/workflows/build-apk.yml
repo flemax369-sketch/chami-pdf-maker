@@ -57,3 +57,54 @@ jobs:
         with:
           name: pdf-maker-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      # SIGNED RELEASE - one-time keystore generation.
+      # If ANDROID_KEYSTORE_BASE64 is set, reuse that keystore instead.
+      # Otherwise generate a NEW keystore with alias "upload" from
+      # STORE_PASSWORD / KEY_PASSWORD. No secrets in if conditions -
+      # GitHub rejects secrets there - all checks are in shell.
+      # IMPORTANT: download the upload-keystore artifact after this
+      # run and save my-upload-key.jks + both passwords safely.
+      # Losing them means the app can never be updated.
+      - name: Prepare upload keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
+            echo "Reused keystore from secret."
+          elif [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            keytool -genkey -v -keystore my-upload-key.jks -storepass "$STORE_PASSWORD" -alias upload -keypass "$KEY_PASSWORD" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Chami, O=Chami, C=IN"
+            echo "Generated new upload keystore."
+          else
+            echo "No keystore secrets set, skipping release build."
+          fi
+          ls -la my-upload-key.jks || true
+
+      - name: Build signed release APK
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ ! -f my-upload-key.jks ]; then
+            echo "No upload keystore, skipping release build."
+            exit 0
+          fi
+          gradle assembleRelease --stacktrace
+
+      - name: Upload signed release APK
+        if: hashFiles('app/build/outputs/apk/release/app-release.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-maker-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload upload keystore
+        if: hashFiles('my-upload-key.jks') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-keystore
+          path: my-upload-key.jks
