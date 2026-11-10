@@ -61,6 +61,9 @@ jobs:
       # SIGNED RELEASE - one-time keystore generation.
       # If ANDROID_KEYSTORE_BASE64 is set, reuse that keystore instead.
       # Otherwise generate a NEW keystore with alias "upload" from
+      # FIX run #6: keytool defaults to PKCS12, which ignores a different
+      # -keypass value, so Gradle could not read the key. -storetype JKS
+      # supports different store and key passwords.
       # STORE_PASSWORD / KEY_PASSWORD. No secrets in if conditions -
       # GitHub rejects secrets there - all checks are in shell.
       # IMPORTANT: download the upload-keystore artifact after this
@@ -76,12 +79,21 @@ jobs:
             echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
             echo "Reused keystore from secret."
           elif [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
-            keytool -genkey -v -keystore my-upload-key.jks -storepass "$STORE_PASSWORD" -alias upload -keypass "$KEY_PASSWORD" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Chami, O=Chami, C=IN"
+            keytool -genkey -v -keystore my-upload-key.jks -storetype JKS -storepass "$STORE_PASSWORD" -alias upload -keypass "$KEY_PASSWORD" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Chami, O=Chami, C=IN"
             echo "Generated new upload keystore."
           else
             echo "No keystore secrets set, skipping release build."
           fi
           ls -la my-upload-key.jks || true
+
+      # Upload the keystore BEFORE building release, so it is saved
+      # even if the release build fails.
+      - name: Upload upload keystore
+        if: hashFiles('my-upload-key.jks') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-keystore
+          path: my-upload-key.jks
 
       - name: Build signed release APK
         env:
@@ -101,10 +113,3 @@ jobs:
         with:
           name: pdf-maker-release-apk
           path: app/build/outputs/apk/release/app-release.apk
-
-      - name: Upload upload keystore
-        if: hashFiles('my-upload-key.jks') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: upload-keystore
-          path: my-upload-key.jks
