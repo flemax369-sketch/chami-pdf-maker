@@ -1,0 +1,37 @@
+name: Extract v1.2 project (one-off)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Extract v1.2 ZIP into the repo root
+        run: |
+          set -e
+          ls -la
+          mkdir -p /tmp/v12
+          unzip -o chami-v12-merged.zip -d /tmp/v12
+          cp -a /tmp/v12/chami-v12-merged/. .
+          rm -f chami-v12-merged.zip chami---img-to-pdf.zip
+          rm -f .github/workflows/unzip-v12.yml
+          echo '--- repo root after extraction ---'
+          ls -la
+          echo '--- git status ---'
+          git status --short
+
+      - name: Commit extracted v1.2 files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status --short
+          git commit -m "Upload Chami PDF Maker v1.2 (merged project)"
+          git push
