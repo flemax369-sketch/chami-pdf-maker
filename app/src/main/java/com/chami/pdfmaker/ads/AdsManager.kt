@@ -9,7 +9,7 @@ import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
 
 object AdsManager {
   // Google TEST interstitial unit ID. Replace with your real unit ID later.
-  private const val UNIT_ID = "ca-app-pub-3940256099942544/1033173712"
+  private const val UNIT_ID = "ca-app-pub-5226394066913183/3797336166"
   private var ad: InterstitialAd? = null
   private var lastShown = 0L
   private var savesSinceAd = 0

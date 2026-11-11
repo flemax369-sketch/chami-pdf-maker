@@ -59,14 +59,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.onSizeChanged
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chami.pdfmaker.ads.AdsManager
@@ -781,13 +784,13 @@ fun PdfEditorScreen(theme: ChamiTheme, onBack: () -> Unit) {
                 }
                 is Annotation.Signature -> drawImage(
                   image = a.bitmap.asImageBitmap(),
-                  dstOffset = Offset(a.x / 595f * size.width, a.y / 842f * size.height),
-                  dstSize = Size(a.w / 595f * size.width, a.h / 842f * size.height)
+                  dstOffset = IntOffset((a.x / 595f * size.width).roundToInt(), (a.y / 842f * size.height).roundToInt()),
+                  dstSize = IntSize((a.w / 595f * size.width).roundToInt(), (a.h / 842f * size.height).roundToInt())
                 )
                 is Annotation.ImageStamp -> drawImage(
                   image = a.bitmap.asImageBitmap(),
-                  dstOffset = Offset(a.x / 595f * size.width, a.y / 842f * size.height),
-                  dstSize = Size(a.w / 595f * size.width, a.h / 842f * size.height)
+                  dstOffset = IntOffset((a.x / 595f * size.width).roundToInt(), (a.y / 842f * size.height).roundToInt()),
+                  dstSize = IntSize((a.w / 595f * size.width).roundToInt(), (a.h / 842f * size.height).roundToInt())
                 )
               }
             }
