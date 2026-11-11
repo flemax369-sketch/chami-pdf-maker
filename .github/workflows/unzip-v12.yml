@@ -21,7 +21,10 @@ jobs:
           unzip -o chami-v12-merged.zip -d /tmp/v12
           cp -a /tmp/v12/chami-v12-merged/. .
           rm -f chami-v12-merged.zip chami---img-to-pdf.zip
-          rm -f .github/workflows/unzip-v12.yml
+          # The GitHub Actions token cannot create or update workflow files,
+          # so do not commit build-apk.yml here; it will be added via the web UI.
+          # This workflow file itself is also left in place for later web-UI deletion.
+          rm -f .github/workflows/build-apk.yml
           echo '--- repo root after extraction ---'
           ls -la
           echo '--- git status ---'
