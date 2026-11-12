@@ -10,7 +10,6 @@ import com.chami.pdfmaker.pdf.PdfEngine
 import com.chami.pdfmaker.pdf.PdfReader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import android.content.Intent
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -20,7 +19,6 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -111,7 +109,7 @@ private fun HistoryThumb(file: File, theme: ChamiTheme) {
   }
   Box(
     Modifier
-      .size(48.dp)
+      .size(72.dp)
       .clip(RoundedCornerShape(8.dp))
       .background(theme.bg)
       .border(1.dp, theme.cardBorder, RoundedCornerShape(8.dp)),
@@ -141,9 +139,21 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
   val favPrefs = remember { ctx.getSharedPreferences("chami_history_favs", Context.MODE_PRIVATE) }
-  var fileList by remember { mutableStateOf<List<File>>(emptyList()) }
-  var storageUsed by remember { mutableStateOf(0L) }
-  var storageTotal by remember { mutableStateOf(0L) }
+  // Phase 5 FLICKER FIX: the file list is loaded SYNCHRONOUSLY here,
+  // before the first composition, instead of starting empty and filling
+  // in from LaunchedEffect. The screen therefore never shows the
+  // "No Documents Found" empty state for a millisecond when files exist
+  // — the first frame already has the real list (or the true empty state).
+  // `loaded` stays as a guard: until the first refresh completes, show
+  // a blank background, never the empty state.
+  fun loadFilesNow(): List<File> {
+    val dir = File(ctx.getExternalFilesDir(null), "Chami")
+    return if (dir.exists()) dir.listFiles()?.filter { it.isFile } ?: emptyList() else emptyList()
+  }
+  var fileList by remember { mutableStateOf(loadFilesNow()) }
+  var storageUsed by remember { mutableStateOf(fileList.sumOf { it.length() }) }
+  var storageTotal by remember { mutableStateOf(storageUsed + (File(ctx.getExternalFilesDir(null), "Chami").usableSpace)) }
+  var loaded by remember { mutableStateOf(false) }
   var query by remember { mutableStateOf("") }
   var filter by remember { mutableStateOf("All") }
   var sortMode by remember { mutableStateOf("Newest") }
@@ -157,7 +167,6 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
   var fileToRename by remember { mutableStateOf<File?>(null) }
   var renameText by remember { mutableStateOf("") }
   var menuFor by remember { mutableStateOf<String?>(null) }
-  var showClearOld by remember { mutableStateOf(false) }
   var pageCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
 
   fun vibrate() {
@@ -180,6 +189,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       storageUsed = 0L
       storageTotal = 0L
     }
+    loaded = true
   }
 
   LaunchedEffect(Unit) { refresh() }
@@ -293,15 +303,6 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
         fontSize = 12.sp,
         color = theme.textSecondary
       )
-      TextButton(onClick = { vibrate(); showClearOld = true }) {
-        Text(
-          "CLEAR OLD FILES",
-          fontFamily = PixelFont,
-          fontSize = 11.sp,
-          fontWeight = FontWeight.Bold,
-          color = theme.primary
-        )
-      }
     }
     LinearProgressIndicator(
       progress = if (storageTotal > 0) storageUsed.toFloat() / storageTotal else 0f,
@@ -453,7 +454,10 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
 
     Spacer(Modifier.height(10.dp))
 
-    if (visible.isEmpty()) {
+    if (!loaded) {
+      // Loading: blank background, NOT the empty state (flicker fix).
+      Box(Modifier.fillMaxSize().background(theme.bg))
+    } else if (visible.isEmpty()) {
       Box(
         Modifier
           .fillMaxSize()
@@ -756,47 +760,6 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       )
     }
 
-    // Clear old files (older than 30 days).
-    if (showClearOld) {
-      val oldFiles = fileList.filter {
-        it.lastModified() < System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000 &&
-          !favourites.contains(it.absolutePath)
-      }
-      AlertDialog(
-        onDismissRequest = { showClearOld = false },
-        confirmButton = {
-          Button(
-            onClick = {
-              vibrate()
-              showClearOld = false
-              if (oldFiles.isNotEmpty()) deleteFiles(oldFiles)
-              else Toast.makeText(ctx, "No files older than 30 days", Toast.LENGTH_SHORT).show()
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            enabled = oldFiles.isNotEmpty()
-          ) {
-            Text("CLEAR ${oldFiles.size}", fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
-        },
-        dismissButton = {
-          TextButton(onClick = { showClearOld = false }) {
-            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-          }
-        },
-        title = {
-          Text("Clear old files?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        },
-        text = {
-          Text(
-            if (oldFiles.isEmpty()) "No files older than 30 days."
-            else "Delete ${oldFiles.size} file(s) older than 30 days? Favourites are kept.",
-            fontFamily = PixelFont,
-            fontSize = 13.sp,
-            color = theme.textSecondary
-          )
-        }
-      )
-    }
   }
 }
 
@@ -809,29 +772,17 @@ fun SettingsScreen(
 ) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
-  var hapticOn by remember { mutableStateOf(tm.hapticOn()) }
+  // Phase 5: no haptic toggle any more — haptic is always on
+  // (ThemeManager.hapticOn() now always returns true).
 
   var showClearCacheDialog by remember { mutableStateOf(false) }
   var showPrivacyPolicy by remember { mutableStateOf(false) }
 
   fun vibrate() {
-    if (hapticOn) {
-      try {
-        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-      } catch (_: Exception) {}
-    }
-  }
-
-  fun shareWithFriends() {
-    vibrate()
-    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-      type = "text/plain"
-      putExtra(
-        Intent.EXTRA_TEXT,
-        "Try Chami - Professional PDF & Scanner Suite! Convert photos to PDF, scan documents, protect PDFs with password, compress to KB, split/merge & more. Fast, 100% offline with zero lag!"
-      )
-    }
-    ctx.startActivity(Intent.createChooser(shareIntent, "Share Chami with colleagues & friends"))
+    // Haptic is always on (no toggle) — always give the tap feedback.
+    try {
+      haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+    } catch (_: Exception) {}
   }
 
   Column(
@@ -841,14 +792,14 @@ fun SettingsScreen(
       .verticalScroll(rememberScrollState())
   ) {
     Text(
-      text = "SETTINGS & PREFERENCES",
+      text = "Settings",
       fontFamily = PixelFont,
       fontWeight = FontWeight.ExtraBold,
-      fontSize = 20.sp,
+      fontSize = 16.sp,
       color = theme.text
     )
     Text(
-      text = "Customize appearance, haptics and security",
+      text = "Appearance and security",
       fontFamily = PixelFont,
       fontSize = 12.sp,
       color = theme.textSecondary
@@ -858,10 +809,10 @@ fun SettingsScreen(
 
     // SECTION 1: THEME & COLOR PALETTE
     Text(
-      "THEME & PALETTE",
+      "THEME",
       fontFamily = PixelFont,
       fontWeight = FontWeight.Bold,
-      fontSize = 13.sp,
+      fontSize = 12.sp,
       color = theme.primary
     )
     Spacer(Modifier.height(8.dp))
@@ -920,7 +871,7 @@ fun SettingsScreen(
               Text(
                 th.name,
                 fontFamily = PixelFont,
-                fontSize = 14.sp,
+                fontSize = 13.sp,
                 color = theme.text,
                 fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold
               )
@@ -940,7 +891,7 @@ fun SettingsScreen(
             Text(
               th.subtitle,
               fontFamily = PixelFont,
-              fontSize = 12.sp,
+              fontSize = 11.sp,
               color = theme.textSecondary,
               maxLines = 1
             )
@@ -963,109 +914,7 @@ fun SettingsScreen(
 
     Spacer(Modifier.height(20.dp))
 
-    // SECTION 2: HARDWARE & INTERACTION
-    Text(
-      "CONTROLS & HAPTICS",
-      fontFamily = PixelFont,
-      fontWeight = FontWeight.Bold,
-      fontSize = 13.sp,
-      color = theme.primary
-    )
-    Spacer(Modifier.height(8.dp))
-
-    Column(
-      Modifier
-        .fillMaxWidth()
-        .clip(RoundedCornerShape(16.dp))
-        .background(theme.card)
-        .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-        .padding(14.dp)
-    ) {
-      Row(
-        Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-      ) {
-        Column(Modifier.weight(1f)) {
-          Text(
-            "HAPTIC FEEDBACK",
-            fontFamily = PixelFont,
-            fontWeight = FontWeight.Bold,
-            fontSize = 13.sp,
-            color = theme.text
-          )
-          Spacer(Modifier.height(2.dp))
-          Text(
-            "Tactile click vibration on buttons and chips",
-            fontFamily = PixelFont,
-            fontSize = 12.sp,
-            color = theme.textSecondary
-          )
-        }
-        Switch(
-          checked = hapticOn,
-          onCheckedChange = {
-            hapticOn = it
-            tm.setHaptic(it)
-            if (it) {
-              try {
-                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-              } catch (_: Exception) {}
-            }
-          },
-          colors = SwitchDefaults.colors(
-            checkedThumbColor = theme.primary,
-            checkedTrackColor = theme.primary.copy(alpha = 0.3f)
-          )
-        )
-      }
-
-    }
-
     Spacer(Modifier.height(20.dp))
-
-    // SECTION 3: SHARE WITH FRIENDS
-    Column(
-      Modifier
-        .fillMaxWidth()
-        .clip(RoundedCornerShape(16.dp))
-        .background(theme.card)
-        .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-        .padding(16.dp)
-    ) {
-      Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("👥", fontSize = 20.sp)
-        Spacer(Modifier.width(10.dp))
-        Text(
-          "SHARE WITH FRIENDS & COLLEAGUES",
-          fontFamily = PixelFont,
-          fontWeight = FontWeight.ExtraBold,
-          fontSize = 13.sp,
-          color = theme.text
-        )
-      }
-      Spacer(Modifier.height(6.dp))
-      Text(
-        "Recommend this fast, private, 100% offline PDF utility that respects user privacy with no subscriptions.",
-        fontFamily = PixelFont,
-        fontSize = 12.sp,
-        color = theme.textSecondary
-      )
-      Spacer(Modifier.height(14.dp))
-      Button(
-        onClick = { shareWithFriends() },
-        modifier = Modifier.fillMaxWidth().height(44.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-        shape = RoundedCornerShape(10.dp)
-      ) {
-        Text(
-          "SHARE CHAMI APP",
-          fontFamily = PixelFont,
-          color = theme.textOnPrimary,
-          fontSize = 12.sp,
-          fontWeight = FontWeight.Bold
-        )
-      }
-    }
 
     Spacer(Modifier.height(16.dp))
 
@@ -1115,24 +964,30 @@ fun SettingsScreen(
 
     Spacer(Modifier.height(24.dp))
 
-    // BRAND FOOTER
+    // Clean version card (Phase 5): just the version and the tagline —
+    // exactly "Easy. Faster. Safe.", nothing else.
     Column(
-      Modifier.fillMaxWidth(),
+      Modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(16.dp))
+        .background(theme.card)
+        .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
+        .padding(16.dp),
       horizontalAlignment = Alignment.CenterHorizontally
     ) {
       Text(
-        "CHAMI PRO • PDF & SCANNER SUITE",
+        "Version 1.2",
         fontFamily = PixelFont,
         fontWeight = FontWeight.Bold,
-        fontSize = 12.sp,
-        color = theme.textSecondary
+        fontSize = 14.sp,
+        color = theme.text
       )
       Spacer(Modifier.height(3.dp))
       Text(
-        "Version 1.2 • 100% Offline • Zero Lag • Secure",
+        "Easy. Faster. Safe.",
         fontFamily = PixelFont,
-        fontSize = 11.sp,
-        color = theme.textSecondary.copy(alpha = 0.7f)
+        fontSize = 12.sp,
+        color = theme.textSecondary
       )
     }
 
@@ -1167,7 +1022,7 @@ fun SettingsScreen(
           }
         },
         title = {
-          Text("Clear Temporary Cache?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+          Text("Clear Temporary Cache?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp)
         },
         text = {
           Text(
@@ -1193,7 +1048,7 @@ fun SettingsScreen(
           }
         },
         title = {
-          Text("Privacy Policy", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+          Text("Privacy Policy", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp)
         },
         text = {
           Box(Modifier.height(300.dp)) {
