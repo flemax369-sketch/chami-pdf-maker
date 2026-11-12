@@ -1,6 +1,15 @@
 package com.chami.pdfmaker.ui
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import com.chami.pdfmaker.pdf.PdfEngine
+import com.chami.pdfmaker.pdf.PdfReader
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import android.content.Intent
 import android.webkit.WebView
 import android.widget.Toast
@@ -36,14 +45,119 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+// Phase 4, point 6: History tab — search, filter by tool, sort, first-page
+// thumbnails, date groups, multi-select, rename, favourites, storage used.
+// Tool is inferred from the file-name prefix the app itself writes
+// (Chami_ = Images to PDF, Scan_ = Scan, Split_ = Split, Merged_ = Merge,
+// Compress_/Compressed_ = Compress, Resized_ = Resizer, protected_ = Protect).
+// There is no per-file tool record in v1.2, so files with an unknown prefix
+// only appear under "All". Before→after KB is NOT shown: no record of the
+// original size exists for a saved file, so only the current size is shown.
+
+private sealed class HistoryEntry {
+  data class Header(val title: String) : HistoryEntry()
+  data class FileRow(val file: File) : HistoryEntry()
+}
+
+private fun historyToolOf(file: File): String {
+  val n = file.name
+  return when {
+    n.startsWith("Chami_") -> "Images to PDF"
+    n.startsWith("Scan_") -> "Scan"
+    n.startsWith("Split_") -> "Split"
+    n.startsWith("Merged_") -> "Merge"
+    n.startsWith("Compress_") || n.startsWith("Compressed_") -> "Compress"
+    n.startsWith("Resized_") -> "Resizer"
+    n.startsWith("protected_") -> "Protect"
+    else -> "Other"
+  }
+}
+
+private fun historyDateBucket(lastModified: Long): String {
+  val cal = java.util.Calendar.getInstance()
+  val today = java.util.Calendar.getInstance().apply {
+    set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0)
+    set(java.util.Calendar.SECOND, 0); set(java.util.Calendar.MILLISECOND, 0)
+  }.timeInMillis
+  val day = 24L * 60 * 60 * 1000
+  return when {
+    lastModified >= today -> "Today"
+    lastModified >= today - day -> "Yesterday"
+    lastModified >= today - 7 * day -> "This week"
+    else -> "Older"
+  }
+}
+
+private fun formatKb(bytes: Long): String {
+  return if (bytes >= 1024 * 1024) "%.1f MB".format(bytes / (1024f * 1024f))
+  else "${bytes / 1024} KB"
+}
+
+@Composable
+private fun HistoryThumb(file: File, theme: ChamiTheme) {
+  val ctx = LocalContext.current
+  var bmp by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
+  LaunchedEffect(file.absolutePath) {
+    withContext(Dispatchers.IO) {
+      val uri = Uri.fromFile(file)
+      val b = if (file.name.endsWith(".pdf", ignoreCase = true)) {
+        PdfReader.renderPageBitmap(ctx, uri, 0, 0.35f)
+      } else {
+        PdfEngine.loadBitmap(ctx, uri, 200)
+      }
+      withContext(Dispatchers.Main) { bmp = b }
+    }
+  }
+  Box(
+    Modifier
+      .size(48.dp)
+      .clip(RoundedCornerShape(8.dp))
+      .background(theme.bg)
+      .border(1.dp, theme.cardBorder, RoundedCornerShape(8.dp)),
+    contentAlignment = Alignment.Center
+  ) {
+    val b = bmp
+    if (b != null) {
+      Image(
+        bitmap = b.asImageBitmap(),
+        contentDescription = "First page of ${file.name}",
+        modifier = Modifier.fillMaxSize(),
+        contentScale = ContentScale.Crop
+      )
+    } else {
+      Text(
+        if (file.name.endsWith(".pdf", ignoreCase = true)) "📄" else "🖼️",
+        fontSize = 20.sp
+      )
+    }
+  }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun HistoryScreen(theme: ChamiTheme) {
+fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
+  val favPrefs = remember { ctx.getSharedPreferences("chami_history_favs", Context.MODE_PRIVATE) }
   var fileList by remember { mutableStateOf<List<File>>(emptyList()) }
+  var storageUsed by remember { mutableStateOf(0L) }
+  var storageTotal by remember { mutableStateOf(0L) }
+  var query by remember { mutableStateOf("") }
+  var filter by remember { mutableStateOf("All") }
+  var sortMode by remember { mutableStateOf("Newest") }
+  var sortMenuOpen by remember { mutableStateOf(false) }
+  var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
+  var favourites by remember {
+    mutableStateOf(favPrefs.getStringSet("favs", emptySet())?.toSet() ?: emptySet())
+  }
   var fileToDelete by remember { mutableStateOf<File?>(null) }
+  var filesToDelete by remember { mutableStateOf<List<File>>(emptyList()) }
+  var fileToRename by remember { mutableStateOf<File?>(null) }
+  var renameText by remember { mutableStateOf("") }
+  var menuFor by remember { mutableStateOf<String?>(null) }
+  var showClearOld by remember { mutableStateOf(false) }
+  var pageCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
 
   fun vibrate() {
     if (tm.hapticOn()) {
@@ -56,48 +170,225 @@ fun HistoryScreen(theme: ChamiTheme) {
   fun refresh() {
     val dir = File(ctx.getExternalFilesDir(null), "Chami")
     if (dir.exists()) {
-      val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: emptyList()
+      val files = dir.listFiles()?.filter { it.isFile } ?: emptyList()
       fileList = files
+      storageUsed = files.sumOf { it.length() }
+      storageTotal = storageUsed + dir.usableSpace
     } else {
       fileList = emptyList()
+      storageUsed = 0L
+      storageTotal = 0L
     }
   }
 
-  LaunchedEffect(Unit) {
-    refresh()
+  LaunchedEffect(Unit) { refresh() }
+
+  // Page counts are loaded off the main thread, one file at a time.
+  LaunchedEffect(fileList) {
+    withContext(Dispatchers.IO) {
+      val counts = mutableMapOf<String, Int>()
+      fileList.filter { it.name.endsWith(".pdf", ignoreCase = true) }.forEach { f ->
+        val n = PdfEngine.pageCount(ctx, Uri.fromFile(f))
+        if (n > 0) counts[f.absolutePath] = n
+      }
+      withContext(Dispatchers.Main) { pageCounts = counts }
+    }
   }
+
+  fun toggleFavourite(file: File) {
+    val next = if (favourites.contains(file.absolutePath)) favourites - file.absolutePath
+    else favourites + file.absolutePath
+    favourites = next
+    favPrefs.edit().putStringSet("favs", next).apply()
+  }
+
+  fun deleteFiles(files: List<File>) {
+    files.forEach { it.delete() }
+    selected = emptySet()
+    fileToDelete = null
+    filesToDelete = emptyList()
+    refresh()
+    Toast.makeText(ctx, "File deleted", Toast.LENGTH_SHORT).show()
+  }
+
+  val sdf = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
+
+  // Search + filter + favourite-first + sort. Tool filter uses the
+  // file-name prefix (see historyToolOf); "PDF to Images", "Reader" and
+  // "OCR" write no files into the Chami folder, so those chips are
+  // honestly empty unless such a file exists.
+  val visible = remember(fileList, query, filter, sortMode, favourites) {
+    var list = fileList.filter { f ->
+      (query.isBlank() || f.name.contains(query, ignoreCase = true)) &&
+        (filter == "All" || historyToolOf(f) == filter)
+    }
+    list = when (sortMode) {
+      "Oldest" -> list.sortedBy { it.lastModified() }
+      "Biggest" -> list.sortedByDescending { it.length() }
+      "Name" -> list.sortedBy { it.name.lowercase(Locale.getDefault()) }
+      else -> list.sortedByDescending { it.lastModified() }
+    }
+    // Favourites / pinned files always come first.
+    list.sortedByDescending { favourites.contains(it.absolutePath) }
+  }
+
+  // Group headers only for date sorts; Name/Biggest stay a flat list.
+  val entries: List<HistoryEntry> = remember(visible, sortMode) {
+    if (sortMode == "Name" || sortMode == "Biggest") {
+      visible.map { HistoryEntry.FileRow(it) }
+    } else {
+      val out = mutableListOf<HistoryEntry>()
+      var lastBucket: String? = null
+      visible.forEach { f ->
+        val bucket = historyDateBucket(f.lastModified())
+        if (bucket != lastBucket) {
+          out.add(HistoryEntry.Header(bucket))
+          lastBucket = bucket
+        }
+        out.add(HistoryEntry.FileRow(f))
+      }
+      out
+    }
+  }
+
+  val filterChips = listOf(
+    "All", "Images to PDF", "Scan", "Merge", "Split", "Protect",
+    "Compress", "PDF to Images", "Resizer", "Reader", "OCR"
+  )
+  val multiSelect = selected.isNotEmpty()
 
   Column(
     Modifier
       .fillMaxSize()
       .padding(16.dp)
   ) {
+    // Title — smaller, consistent hierarchy (Phase 4, point 7).
+    Text(
+      text = "History",
+      fontFamily = PixelFont,
+      fontWeight = FontWeight.ExtraBold,
+      fontSize = 20.sp,
+      color = theme.text
+    )
+    Text(
+      text = "${fileList.size} documents saved",
+      fontFamily = PixelFont,
+      fontSize = 12.sp,
+      color = theme.textSecondary
+    )
+
+    Spacer(Modifier.height(10.dp))
+
+    // Storage used (Phase 4, point 6) — real folder size, bar is the
+    // folder size against folder size + free space on that storage.
+    Row(
+      Modifier.fillMaxWidth(),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+      Text(
+        "Storage used: ${formatKb(storageUsed)}",
+        fontFamily = PixelFont,
+        fontSize = 12.sp,
+        color = theme.textSecondary
+      )
+      TextButton(onClick = { vibrate(); showClearOld = true }) {
+        Text(
+          "CLEAR OLD FILES",
+          fontFamily = PixelFont,
+          fontSize = 11.sp,
+          fontWeight = FontWeight.Bold,
+          color = theme.primary
+        )
+      }
+    }
+    LinearProgressIndicator(
+      progress = if (storageTotal > 0) storageUsed.toFloat() / storageTotal else 0f,
+      modifier = Modifier.fillMaxWidth(),
+      color = theme.primary,
+      trackColor = theme.cardBorder
+    )
+
+    Spacer(Modifier.height(10.dp))
+
+    // Search by file name.
+    OutlinedTextField(
+      value = query,
+      onValueChange = { query = it },
+      placeholder = {
+        Text("Search files…", fontFamily = PixelFont, fontSize = 12.sp, color = theme.textSecondary)
+      },
+      singleLine = true,
+      modifier = Modifier.fillMaxWidth().height(48.dp),
+      shape = RoundedCornerShape(10.dp),
+      colors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = theme.primary,
+        unfocusedBorderColor = theme.cardBorder,
+        focusedContainerColor = theme.card,
+        unfocusedContainerColor = theme.card
+      )
+    )
+
+    Spacer(Modifier.height(8.dp))
+
+    // Filter by tool (horizontal chip row).
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+      items(filterChips) { chip ->
+        val isSel = filter == chip
+        Box(
+          Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (isSel) theme.primary else theme.card)
+            .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
+            .clickable { vibrate(); filter = chip }
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+          contentAlignment = Alignment.Center
+        ) {
+          Text(
+            chip,
+            fontFamily = PixelFont,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (isSel) theme.textOnPrimary else theme.text
+          )
+        }
+      }
+    }
+
+    Spacer(Modifier.height(8.dp))
+
+    // Sort + refresh row.
     Row(
       Modifier.fillMaxWidth(),
       horizontalArrangement = Arrangement.SpaceBetween,
       verticalAlignment = Alignment.CenterVertically
     ) {
-      Column {
-        Text(
-          text = "RECENT FILES",
-          fontFamily = PixelFont,
-          fontWeight = FontWeight.ExtraBold,
-          fontSize = 20.sp,
-          color = theme.text
-        )
-        Text(
-          text = "${fileList.size} documents saved",
-          fontFamily = PixelFont,
-          fontSize = 12.sp,
-          color = theme.textSecondary
-        )
+      Box {
+        OutlinedButton(
+          onClick = { vibrate(); sortMenuOpen = true },
+          shape = RoundedCornerShape(10.dp),
+          border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
+          colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.primary),
+          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+          Text("SORT: $sortMode", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        DropdownMenu(
+          expanded = sortMenuOpen,
+          onDismissRequest = { sortMenuOpen = false }
+        ) {
+          listOf("Newest", "Oldest", "Biggest", "Name").forEach { mode ->
+            DropdownMenuItem(
+              text = {
+                Text(mode, fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
+              },
+              onClick = { sortMode = mode; sortMenuOpen = false }
+            )
+          }
+        }
       }
-
       OutlinedButton(
-        onClick = {
-          vibrate()
-          refresh()
-        },
+        onClick = { vibrate(); refresh() },
         shape = RoundedCornerShape(10.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.primary),
@@ -107,9 +398,61 @@ fun HistoryScreen(theme: ChamiTheme) {
       }
     }
 
-    Spacer(Modifier.height(16.dp))
+    // Multi-select action bar.
+    if (multiSelect) {
+      Spacer(Modifier.height(8.dp))
+      Row(
+        Modifier
+          .fillMaxWidth()
+          .clip(RoundedCornerShape(10.dp))
+          .background(theme.primary.copy(alpha = 0.12f))
+          .padding(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Text(
+          "${selected.size} selected",
+          fontFamily = PixelFont,
+          fontSize = 12.sp,
+          fontWeight = FontWeight.Bold,
+          color = theme.text,
+          modifier = Modifier.weight(1f)
+        )
+        Button(
+          onClick = {
+            vibrate()
+            val files = fileList.filter { selected.contains(it.absolutePath) }
+            files.forEach { f ->
+              val mime = if (f.name.endsWith(".pdf", ignoreCase = true)) "application/pdf" else "image/jpeg"
+              ShareHelper.shareFile(ctx, f, mime)
+            }
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+          shape = RoundedCornerShape(8.dp),
+          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+          Text("SHARE", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        Button(
+          onClick = {
+            vibrate()
+            filesToDelete = fileList.filter { selected.contains(it.absolutePath) }
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+          shape = RoundedCornerShape(8.dp),
+          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+          Text("DELETE", fontFamily = PixelFont, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        TextButton(onClick = { selected = emptySet() }) {
+          Text("CANCEL", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
+        }
+      }
+    }
 
-    if (fileList.isEmpty()) {
+    Spacer(Modifier.height(10.dp))
+
+    if (visible.isEmpty()) {
       Box(
         Modifier
           .fillMaxSize()
@@ -137,12 +480,13 @@ fun HistoryScreen(theme: ChamiTheme) {
             "No Documents Found",
             fontFamily = PixelFont,
             fontWeight = FontWeight.Bold,
-            fontSize = 17.sp,
+            fontSize = 15.sp,
             color = theme.text
           )
           Spacer(Modifier.height(6.dp))
           Text(
-            "Created PDFs, scans, and converted files will appear here.",
+            if (query.isNotBlank() || filter != "All") "No files match this search or filter."
+            else "Created PDFs, scans, and converted files will appear here.",
             fontFamily = PixelFont,
             fontSize = 12.sp,
             color = theme.textSecondary,
@@ -151,112 +495,147 @@ fun HistoryScreen(theme: ChamiTheme) {
         }
       }
     } else {
-      val sdf = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
       LazyColumn(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(10.dp)
       ) {
-        items(fileList) { file ->
-          val mime = if (file.name.endsWith(".pdf", ignoreCase = true)) "application/pdf"
-          else if (file.name.endsWith(".txt", ignoreCase = true)) "text/plain"
-          else "image/jpeg"
-
-          val isPdf = file.name.endsWith(".pdf", true)
-          val isTxt = file.name.endsWith(".txt", true)
-
-          Column(
-            Modifier
-              .fillMaxWidth()
-              .clip(RoundedCornerShape(14.dp))
-              .background(theme.card)
-              .border(1.dp, theme.cardBorder, RoundedCornerShape(14.dp))
-              .combinedClickable(
-                onClick = {
-                  vibrate()
-                  ShareHelper.openFile(ctx, file, mime)
-                },
-                onLongClick = {
-                  vibrate()
-                  fileToDelete = file
-                }
+        items(entries, key = { entry ->
+          when (entry) {
+            is HistoryEntry.Header -> "header:${entry.title}"
+            is HistoryEntry.FileRow -> entry.file.absolutePath
+          }
+        }) { entry ->
+          when (entry) {
+            is HistoryEntry.Header -> {
+              Text(
+                entry.title,
+                fontFamily = PixelFont,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+                color = theme.primary,
+                modifier = Modifier.padding(top = 4.dp)
               )
-              .padding(14.dp)
-          ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                Modifier
-                  .size(42.dp)
-                  .clip(RoundedCornerShape(10.dp))
-                  .background(theme.primary.copy(alpha = 0.12f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Text(
-                  if (isPdf) "📄" else if (isTxt) "📝" else "🖼️",
-                  fontSize = 20.sp
-                )
-              }
-              Spacer(Modifier.width(12.dp))
-              Column(Modifier.weight(1f)) {
-                Text(
-                  file.name,
-                  fontFamily = PixelFont,
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 13.sp,
-                  color = theme.text,
-                  maxLines = 1
-                )
-                Spacer(Modifier.height(3.dp))
-                Text(
-                  "${file.length() / 1024} KB • ${sdf.format(Date(file.lastModified()))}",
-                  fontFamily = PixelFont,
-                  fontSize = 11.sp,
-                  color = theme.textSecondary
-                )
-              }
-              IconButton(onClick = {
-                vibrate()
-                fileToDelete = file
-              }) {
-                Text("🗑️", fontSize = 16.sp)
-              }
             }
-
-            Spacer(Modifier.height(10.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-              Button(
-                onClick = {
-                  vibrate()
-                  ShareHelper.openFile(ctx, file, mime)
-                },
-                modifier = Modifier.weight(1f).height(40.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-                shape = RoundedCornerShape(8.dp)
+            is HistoryEntry.FileRow -> {
+              val file = entry.file
+              val isPdf = file.name.endsWith(".pdf", ignoreCase = true)
+              val mime = if (isPdf) "application/pdf" else "image/jpeg"
+              val isSel = selected.contains(file.absolutePath)
+              val isFav = favourites.contains(file.absolutePath)
+              val pages = pageCounts[file.absolutePath]
+              Column(
+                Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(14.dp))
+                  .background(if (isSel) theme.primary.copy(alpha = 0.12f) else theme.card)
+                  .border(
+                    1.dp,
+                    if (isSel) theme.primary else theme.cardBorder,
+                    RoundedCornerShape(14.dp)
+                  )
+                  .combinedClickable(
+                    onClick = {
+                      vibrate()
+                      if (multiSelect) {
+                        selected = if (isSel) selected - file.absolutePath
+                        else selected + file.absolutePath
+                      } else if (isPdf && onOpenInReader != null) {
+                        // Tap opens the file in the inbuilt PDF Reader.
+                        onOpenInReader(file)
+                      } else {
+                        ShareHelper.openFile(ctx, file, mime)
+                      }
+                    },
+                    onLongClick = {
+                      vibrate()
+                      selected = if (isSel) selected - file.absolutePath
+                      else selected + file.absolutePath
+                    }
+                  )
+                  .padding(12.dp)
               ) {
-                Text(
-                  "OPEN",
-                  fontFamily = PixelFont,
-                  color = theme.textOnPrimary,
-                  fontSize = 12.sp,
-                  fontWeight = FontWeight.Bold
-                )
-              }
-              OutlinedButton(
-                onClick = {
-                  vibrate()
-                  ShareHelper.shareFile(ctx, file, mime)
-                },
-                modifier = Modifier.weight(1f).height(40.dp),
-                shape = RoundedCornerShape(8.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-              ) {
-                Text(
-                  "SHARE",
-                  fontFamily = PixelFont,
-                  color = theme.text,
-                  fontSize = 12.sp,
-                  fontWeight = FontWeight.Bold
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                  if (multiSelect) {
+                    Checkbox(
+                      checked = isSel,
+                      onCheckedChange = {
+                        selected = if (isSel) selected - file.absolutePath
+                        else selected + file.absolutePath
+                      },
+                      colors = CheckboxDefaults.colors(checkedColor = theme.primary)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                  }
+                  HistoryThumb(file, theme)
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                    Text(
+                      file.name,
+                      fontFamily = PixelFont,
+                      fontWeight = FontWeight.Bold,
+                      fontSize = 15.sp,
+                      color = theme.text,
+                      maxLines = 1
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                      buildString {
+                        if (pages != null) append("$pages pages • ")
+                        append(formatKb(file.length()))
+                        append(" • ${sdf.format(Date(file.lastModified()))}")
+                      },
+                      fontFamily = PixelFont,
+                      fontSize = 12.sp,
+                      color = theme.textSecondary
+                    )
+                  }
+                  // Favourite / pin (star, persisted in SharedPreferences).
+                  IconButton(onClick = { vibrate(); toggleFavourite(file) }) {
+                    Text(
+                      if (isFav) "⭐" else "☆",
+                      fontSize = 18.sp,
+                      color = if (isFav) theme.primary else theme.textSecondary
+                    )
+                  }
+                  // Row menu: rename / share / delete.
+                  Box {
+                    IconButton(onClick = { menuFor = file.absolutePath }) {
+                      Text("⋮", fontSize = 18.sp, color = theme.text)
+                    }
+                    DropdownMenu(
+                      expanded = menuFor == file.absolutePath,
+                      onDismissRequest = { menuFor = null }
+                    ) {
+                      DropdownMenuItem(
+                        text = { Text("Rename", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text) },
+                        onClick = {
+                          menuFor = null
+                          renameText = file.nameWithoutExtension
+                          fileToRename = file
+                        }
+                      )
+                      DropdownMenuItem(
+                        text = { Text("Share", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text) },
+                        onClick = {
+                          menuFor = null
+                          ShareHelper.shareFile(ctx, file, mime)
+                        }
+                      )
+                      DropdownMenuItem(
+                        text = { Text("Open", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text) },
+                        onClick = {
+                          menuFor = null
+                          if (isPdf && onOpenInReader != null) onOpenInReader(file)
+                          else ShareHelper.openFile(ctx, file, mime)
+                        }
+                      )
+                      DropdownMenuItem(
+                        text = { Text("Delete", fontFamily = PixelFont, fontSize = 12.sp, color = MaterialTheme.colorScheme.error) },
+                        onClick = { menuFor = null; fileToDelete = file }
+                      )
+                    }
+                  }
+                }
               }
             }
           }
@@ -264,6 +643,7 @@ fun HistoryScreen(theme: ChamiTheme) {
       }
     }
 
+    // Delete one file (from the row menu).
     if (fileToDelete != null) {
       AlertDialog(
         onDismissRequest = { fileToDelete = null },
@@ -271,10 +651,7 @@ fun HistoryScreen(theme: ChamiTheme) {
           Button(
             onClick = {
               vibrate()
-              fileToDelete?.delete()
-              fileToDelete = null
-              refresh()
-              Toast.makeText(ctx, "File deleted", Toast.LENGTH_SHORT).show()
+              fileToDelete?.let { deleteFiles(listOf(it)) }
             },
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
           ) {
@@ -299,8 +676,129 @@ fun HistoryScreen(theme: ChamiTheme) {
         }
       )
     }
+
+    // Delete many files (multi-select bar).
+    if (filesToDelete.isNotEmpty()) {
+      AlertDialog(
+        onDismissRequest = { filesToDelete = emptyList() },
+        confirmButton = {
+          Button(
+            onClick = { vibrate(); deleteFiles(filesToDelete) },
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+          ) {
+            Text("DELETE ${filesToDelete.size}", fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          }
+        },
+        dismissButton = {
+          TextButton(onClick = { filesToDelete = emptyList() }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text("Delete ${filesToDelete.size} files?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          Text(
+            "These files will be permanently deleted. This action cannot be undone.",
+            fontFamily = PixelFont,
+            fontSize = 13.sp,
+            color = theme.textSecondary
+          )
+        }
+      )
+    }
+
+    // Rename a file (same folder, same extension).
+    if (fileToRename != null) {
+      AlertDialog(
+        onDismissRequest = { fileToRename = null },
+        confirmButton = {
+          Button(
+            onClick = {
+              vibrate()
+              val f = fileToRename
+              if (f != null && renameText.isNotBlank()) {
+                val newName = renameText.trim() + "." + f.extension
+                val newFile = File(f.parentFile, newName)
+                if (newFile.exists() && newFile.absolutePath != f.absolutePath) {
+                  Toast.makeText(ctx, "A file with that name already exists", Toast.LENGTH_SHORT).show()
+                } else if (f.renameTo(newFile)) {
+                  Toast.makeText(ctx, "Renamed", Toast.LENGTH_SHORT).show()
+                  fileToRename = null
+                  refresh()
+                } else {
+                  Toast.makeText(ctx, "Could not rename", Toast.LENGTH_SHORT).show()
+                }
+              }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+          ) {
+            Text("RENAME", fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          }
+        },
+        dismissButton = {
+          TextButton(onClick = { fileToRename = null }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text("Rename file", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          OutlinedTextField(
+            value = renameText,
+            onValueChange = { renameText = it },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+          )
+        }
+      )
+    }
+
+    // Clear old files (older than 30 days).
+    if (showClearOld) {
+      val oldFiles = fileList.filter {
+        it.lastModified() < System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000 &&
+          !favourites.contains(it.absolutePath)
+      }
+      AlertDialog(
+        onDismissRequest = { showClearOld = false },
+        confirmButton = {
+          Button(
+            onClick = {
+              vibrate()
+              showClearOld = false
+              if (oldFiles.isNotEmpty()) deleteFiles(oldFiles)
+              else Toast.makeText(ctx, "No files older than 30 days", Toast.LENGTH_SHORT).show()
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+            enabled = oldFiles.isNotEmpty()
+          ) {
+            Text("CLEAR ${oldFiles.size}", fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          }
+        },
+        dismissButton = {
+          TextButton(onClick = { showClearOld = false }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text("Clear old files?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          Text(
+            if (oldFiles.isEmpty()) "No files older than 30 days."
+            else "Delete ${oldFiles.size} file(s) older than 30 days? Favourites are kept.",
+            fontFamily = PixelFont,
+            fontSize = 13.sp,
+            color = theme.textSecondary
+          )
+        }
+      )
+    }
   }
 }
+
 
 @Composable
 fun SettingsScreen(
@@ -310,7 +808,6 @@ fun SettingsScreen(
 ) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
-  var askSave by remember { mutableStateOf(tm.askSaveLocation()) }
   var hapticOn by remember { mutableStateOf(tm.hapticOn()) }
 
   var showClearCacheDialog by remember { mutableStateOf(false) }
@@ -442,7 +939,7 @@ fun SettingsScreen(
             Text(
               th.subtitle,
               fontFamily = PixelFont,
-              fontSize = 11.sp,
+              fontSize = 12.sp,
               color = theme.textSecondary,
               maxLines = 1
             )
@@ -499,7 +996,7 @@ fun SettingsScreen(
           Text(
             "Tactile click vibration on buttons and chips",
             fontFamily = PixelFont,
-            fontSize = 11.sp,
+            fontSize = 12.sp,
             color = theme.textSecondary
           )
         }
@@ -521,44 +1018,6 @@ fun SettingsScreen(
         )
       }
 
-      HorizontalDivider(
-        Modifier.padding(vertical = 12.dp),
-        thickness = 1.dp,
-        color = theme.cardBorder
-      )
-
-      Row(
-        Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-      ) {
-        Column(Modifier.weight(1f)) {
-          Text(
-            "ASK WHERE TO SAVE",
-            fontFamily = PixelFont,
-            fontWeight = FontWeight.Bold,
-            fontSize = 13.sp,
-            color = theme.text
-          )
-          Spacer(Modifier.height(2.dp))
-          Text(
-            "Prompt to choose download/storage folder after creating each file",
-            fontFamily = PixelFont,
-            fontSize = 11.sp,
-            color = theme.textSecondary
-          )
-        }
-        Switch(
-          checked = askSave,
-          onCheckedChange = {
-            askSave = it
-            tm.setAskSaveLocation(it)
-          },
-          colors = SwitchDefaults.colors(
-            checkedThumbColor = theme.primary,
-            checkedTrackColor = theme.primary.copy(alpha = 0.3f)
-          )
-        )
-      }
     }
 
     Spacer(Modifier.height(20.dp))
