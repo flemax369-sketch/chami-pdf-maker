@@ -551,17 +551,15 @@ fun WordTextEditorScreen(theme: ChamiTheme, onBack: () -> Unit) {
       resultFile?.let { file ->
         ResultCard(file, theme)
         Spacer(Modifier.height(8.dp))
-        if (tm.askSaveLocation()) {
-          Button(
-            onClick = { saveLauncher.launch(file.name) },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("SAVE TO FOLDER…", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
-          Spacer(Modifier.height(8.dp))
+        Button(
+          onClick = { saveLauncher.launch(file.name) },
+          modifier = Modifier.fillMaxWidth().height(48.dp),
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+          shape = RoundedCornerShape(8.dp)
+        ) {
+          Text("SAVE TO FOLDER…", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         }
+        Spacer(Modifier.height(8.dp))
       }
     }
 
