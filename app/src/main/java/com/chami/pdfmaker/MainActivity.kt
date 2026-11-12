@@ -1,6 +1,7 @@
 package com.chami.pdfmaker
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -34,6 +35,12 @@ data class ToolItem(val id: String, val title: String, val iconRes: Int, val cat
 class MainActivity : ComponentActivity() {
   override fun onCreate(b: Bundle?) {
     super.onCreate(b)
+    // Phase 4, point 4: screenshots / screen recording are always blocked.
+    // No toggle, no option in the app — FLAG_SECURE is always on.
+    window.setFlags(
+      WindowManager.LayoutParams.FLAG_SECURE,
+      WindowManager.LayoutParams.FLAG_SECURE
+    )
     MobileAds.initialize(this)
     AdsManager.load(this)
     val tm = ThemeManager(this)
@@ -41,6 +48,7 @@ class MainActivity : ComponentActivity() {
       var theme by remember { mutableStateOf(tm.current()) }
       var activeTool by remember { mutableStateOf<String?>(null) }
       var currentTab by remember { mutableStateOf("Home") }
+      var readerFile by remember { mutableStateOf<java.io.File?>(null) }
       val haptic = LocalHapticFeedback.current
 
       fun vibrate() {
@@ -59,14 +67,10 @@ class MainActivity : ComponentActivity() {
         ToolItem("merge", "Merge PDF", R.drawable.tool_ic_05_merge_pdf, "EDIT"),
         ToolItem("split", "Split PDF", R.drawable.tool_ic_06_split_pdf, "EDIT"),
         ToolItem("pdf_img", "PDF to Images", R.drawable.tool_ic_07_pdf_to_images, "CONVERT"),
-        ToolItem("passport", "Passport Photo", R.drawable.tool_ic_08_passport_photo, "PHOTO"),
         ToolItem("resize", "Image Resizer", R.drawable.tool_ic_09_image_resizer, "PHOTO"),
         ToolItem("reader", "PDF Reader", R.drawable.tool_ic_10_pdf_reader, "VIEW"),
         ToolItem("ocr", "OCR Text", R.drawable.tool_ic_11_ocr_text, "EXTRACT"),
-        ToolItem("pdf_text", "PDF to Text", R.drawable.tool_ic_12_pdf_to_text, "CONVERT"),
-        ToolItem("text_pdf", "Text to PDF", R.drawable.tool_ic_13_text_to_pdf, "CREATE"),
         ToolItem("convert", "Format Convert", R.drawable.tool_ic_14_format_convert, "PHOTO"),
-        ToolItem("editor", "PDF Editor", R.drawable.tool_ic_15_pdf_editor, "EDIT")
       )
 
       Surface(modifier = Modifier.fillMaxSize(), color = theme.bg) {
@@ -79,14 +83,10 @@ class MainActivity : ComponentActivity() {
             "split" -> SplitPdfScreen(theme) { activeTool = null }
             "merge" -> MergePdfScreen(theme) { activeTool = null }
             "compress" -> CompressKbScreen(theme) { activeTool = null }
-            "passport" -> PassportPhotoScreen(theme) { activeTool = null }
             "resize" -> ResizeConvertScreen(theme, title = "Image Resizer") { activeTool = null }
             "convert" -> ResizeConvertScreen(theme, title = "Format Convert") { activeTool = null }
             "ocr" -> OcrScreen(theme) { activeTool = null }
-            "reader" -> PdfReaderScreen(theme) { activeTool = null }
-            "pdf_text" -> PdfToTextScreen(theme) { activeTool = null }
-            "text_pdf" -> WordTextEditorScreen(theme) { activeTool = null }
-            "editor" -> PdfEditorScreen(theme) { activeTool = null }
+            "reader" -> PdfReaderScreen(theme, initialFile = readerFile, onOpenTool = { activeTool = it }) { activeTool = null; readerFile = null }
             else -> { activeTool = null }
           }
         } else {
@@ -175,7 +175,7 @@ class MainActivity : ComponentActivity() {
             // Body based on selected bottom tab
             Box(Modifier.weight(1f)) {
               when (currentTab) {
-                "History" -> HistoryScreen(theme)
+                "History" -> HistoryScreen(theme, onOpenInReader = { file -> readerFile = file; activeTool = "reader" })
                 "Settings" -> SettingsScreen(theme, tm) { theme = it }
                 else -> {
                   Column(Modifier.fillMaxSize()) {
@@ -369,7 +369,7 @@ class MainActivity : ComponentActivity() {
               verticalAlignment = Alignment.CenterVertically
             ) {
               val navItems = listOf(
-                Triple("Home", "⚡", "Home"),
+                Triple("Home", "🏠", "Home"),
                 Triple("History", "📁", "History"),
                 Triple("Settings", "⚙️", "Settings")
               )
