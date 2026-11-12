@@ -76,9 +76,13 @@ class ThemeManager(ctx: Context) {
     p.edit().putString("theme_id", id).apply()
   }
 
-  fun hapticOn(): Boolean = p.getBoolean("haptic", true)
+  // Phase 5: haptic is ALWAYS ON — there is no toggle in Settings any
+  // more, so this always returns true (a user who turned it off in an
+  // older version gets haptic back). setHaptic is kept only so old call
+  // sites still compile; it intentionally does nothing now.
+  fun hapticOn(): Boolean = true
   fun setHaptic(v: Boolean) {
-    p.edit().putBoolean("haptic", v).apply()
+    // No-op by design (Phase 5): haptic cannot be turned off.
   }
 
 }
