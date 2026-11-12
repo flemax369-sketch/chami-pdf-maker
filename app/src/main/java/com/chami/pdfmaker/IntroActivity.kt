@@ -2,6 +2,7 @@ package com.chami.pdfmaker
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -17,6 +18,12 @@ import kotlinx.coroutines.delay
 class IntroActivity : ComponentActivity() {
   override fun onCreate(b: Bundle?) {
     super.onCreate(b)
+    // Phase 4, point 4: screenshots / screen recording always blocked,
+    // same as MainActivity. No toggle anywhere in the app.
+    window.setFlags(
+      WindowManager.LayoutParams.FLAG_SECURE,
+      WindowManager.LayoutParams.FLAG_SECURE
+    )
     val tm = ThemeManager(this)
     setContent {
       val theme = tm.current()
