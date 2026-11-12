@@ -356,20 +356,18 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       resultFile?.let { file ->
         Spacer(Modifier.height(12.dp))
         ResultCard(file, theme)
-        if (tm.askSaveLocation()) {
-          Spacer(Modifier.height(12.dp))
-          Button(
-            onClick = {
-              vibrate()
-              pendingSaveFile = file
-              saveLauncher.launch(file.name)
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("SAVE TO FOLDER…", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
+        Spacer(Modifier.height(12.dp))
+        Button(
+          onClick = {
+            vibrate()
+            pendingSaveFile = file
+            saveLauncher.launch(file.name)
+          },
+          modifier = Modifier.fillMaxWidth().height(48.dp),
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+          shape = RoundedCornerShape(8.dp)
+        ) {
+          Text("SAVE TO FOLDER…", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         }
       }
     }
@@ -397,6 +395,17 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 }
 
 // 2. SCAN TO PDF (FIXED CAMERA + RUNTIME PERMISSION + PREVIEW)
+// 2. SCAN TO PDF — Adobe Scan style, Chami green/white (Phase 4, points 9-11).
+// - Capture modes are labels only (Document / Book / ID card / Whiteboard /
+//   Form / Business Card) — they do not change camera behaviour.
+// - Auto-detect is a toggle: when ON, the green detected frame + corner
+//   dots are drawn over the page. There is no ML edge detector in this
+//   project, so the frame defaults to the full page; the real crop
+//   happens in the crop editor (drag the corners there).
+// - Layout v2: vertical toolbar on the LEFT (Retake, Crop, Rotate,
+//   Filters, Adjust, Edit text). Bottom has ONLY the Save PDF button.
+// - Multi-page preview: horizontal thumbnail strip under the main page;
+//   selected page has a green border + green checkmark, tap to switch.
 @Composable
 fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
@@ -405,13 +414,50 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val tm = remember { ThemeManager(ctx) }
   val scope = rememberCoroutineScope()
   var pages by remember { mutableStateOf<List<PageItem>>(emptyList()) }
+  var selectedPage by remember { mutableStateOf(0) }
+  var scanMode by remember { mutableStateOf("Document") }
+  var autoDetect by remember { mutableStateOf(true) }
+  var filterMode by remember { mutableStateOf(0) }
   var isProcessing by remember { mutableStateOf(false) }
   var resultFile by remember { mutableStateOf<File?>(null) }
   var pendingSaveFile by remember { mutableStateOf<File?>(null) }
+  var cropIndex by remember { mutableStateOf<Int?>(null) }
+  var editBusy by remember { mutableStateOf(false) }
+  var showAdjust by remember { mutableStateOf(false) }
+  var brightness by remember { mutableStateOf(0f) }
+  var ocrText by remember { mutableStateOf<String?>(null) }
+  var ocrBusy by remember { mutableStateOf(false) }
+
+  val safeSelected = selectedPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+  val filterNames = listOf("Original", "Black & white", "High contrast")
 
   fun vibrate() {
     if (tm.hapticOn()) {
       try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
+    }
+  }
+
+  // Apply an edited bitmap to one page (crop / rotate / filter / adjust):
+  // save to a temp file first so the PDF uses the edited image.
+  fun replacePage(index: Int, newBitmap: Bitmap, closeCrop: Boolean = true) {
+    val page = pages.getOrNull(index) ?: return
+    if (editBusy) return
+    editBusy = true
+    scope.launch {
+      try {
+        val newUri = ImagePageEditor.bitmapToUri(
+          ctx, newBitmap, "scan_${index}_${System.currentTimeMillis()}.jpg"
+        )
+        val updated = pages.toMutableList()
+        if (index in updated.indices) {
+          updated[index] = PageItem(newUri, newBitmap, cropped = true)
+          pages = updated
+        }
+        if (closeCrop) cropIndex = null
+      } catch (_: Exception) {
+        Toast.makeText(ctx, "Could not apply that edit", Toast.LENGTH_SHORT).show()
+      }
+      editBusy = false
     }
   }
 
@@ -424,6 +470,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
         withContext(Dispatchers.Main) {
           pages = pages + PageItem(Uri.fromFile(f), bmp)
+          selectedPage = pages.size - 1 // select the page just added
         }
       }
     }
@@ -460,8 +507,8 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     }
   }
 
-  // Save-location picker (Phase 1 SaveLocation). pendingSaveFile is set
-  // just before launch so the callback always uses the latest file.
+  // Save-location picker (Phase 1 SaveLocation). Phase 4, point 3: the
+  // SAVE TO FOLDER button is ALWAYS shown — no toggle anywhere.
   val saveLauncher = rememberLauncherForActivityResult(
     ActivityResultContracts.CreateDocument("application/pdf")
   ) { uri ->
@@ -493,10 +540,124 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     }
   }
 
+  // Crop editor for the selected page (Adobe-like: handles + pinch).
+  cropIndex?.let { index ->
+    val page = pages.getOrNull(index)
+    if (page != null) {
+      CropEditorDialog(
+        bitmap = page.bitmap,
+        theme = theme,
+        onApply = { bmp -> replacePage(index, bmp, closeCrop = true) },
+        onDismiss = { if (!editBusy) cropIndex = null },
+        onRotate = { replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) }
+      )
+    }
+  }
+
+  // Adjust (brightness) dialog.
+  if (showAdjust) {
+    val page = pages.getOrNull(safeSelected)
+    AlertDialog(
+      onDismissRequest = { showAdjust = false },
+      title = {
+        Text("ADJUST BRIGHTNESS", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = theme.text)
+      },
+      text = {
+        Column {
+          Text("Brightness: ${brightness.toInt()}", fontFamily = PixelFont, fontSize = 12.sp, color = theme.textSecondary)
+          Slider(
+            value = brightness,
+            onValueChange = { brightness = it },
+            valueRange = -100f..100f,
+            colors = SliderDefaults.colors(thumbColor = theme.primary, activeTrackColor = theme.primary)
+          )
+        }
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            showAdjust = false
+            if (page != null) {
+              replacePage(safeSelected, ImagePageEditor.adjustBrightness(page.bitmap, brightness), closeCrop = true)
+              brightness = 0f
+            }
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+        ) {
+          Text("APPLY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { showAdjust = false; brightness = 0f }) {
+          Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+        }
+      }
+    )
+  }
+
+  // Edit text (OCR) dialog — reads the text off the selected page.
+  if (ocrText != null) {
+    AlertDialog(
+      onDismissRequest = { ocrText = null },
+      title = {
+        Text("TEXT ON THIS PAGE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = theme.text)
+      },
+      text = {
+        Column(Modifier.verticalScroll(rememberScrollState())) {
+          Text(ocrText ?: "", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
+        }
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("Chami OCR", ocrText ?: ""))
+            Toast.makeText(ctx, "Text copied", Toast.LENGTH_SHORT).show()
+            ocrText = null
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+        ) {
+          Text("COPY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { ocrText = null }) {
+          Text("CLOSE", fontFamily = PixelFont, color = theme.text)
+        }
+      }
+    )
+  }
+
   ToolScreenContainer("Scan to PDF", theme, onBack) {
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
       Text("Capture pages one by one with the camera, or pick several images from the gallery. Crop, rotate and reorder pages before making one PDF.", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-      Spacer(Modifier.height(14.dp))
+      Spacer(Modifier.height(12.dp))
+
+      // Capture modes — labels only, they do not change camera behaviour.
+      LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        items(listOf("Document", "Book", "ID card", "Whiteboard", "Form", "Business Card")) { mode ->
+          val isSel = scanMode == mode
+          Box(
+            Modifier
+              .clip(RoundedCornerShape(16.dp))
+              .background(if (isSel) theme.primary else theme.card)
+              .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
+              .clickable { vibrate(); scanMode = mode }
+              .padding(horizontal = 10.dp, vertical = 6.dp),
+            contentAlignment = Alignment.Center
+          ) {
+            Text(
+              mode,
+              fontFamily = PixelFont,
+              fontSize = 11.sp,
+              fontWeight = FontWeight.Bold,
+              color = if (isSel) theme.textOnPrimary else theme.text
+            )
+          }
+        }
+      }
+
+      Spacer(Modifier.height(12.dp))
 
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(
@@ -524,9 +685,257 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         }
       }
 
+      Spacer(Modifier.height(8.dp))
+      Text(
+        "Capturing… hold steady — keep the page flat and inside the frame.",
+        fontFamily = PixelFont, fontSize = 11.sp, color = theme.textSecondary
+      )
+
       if (pages.isNotEmpty()) {
-        Spacer(Modifier.height(16.dp))
-        PageList(pages = pages, theme = theme, onPagesChange = { pages = it })
+        val page = pages[safeSelected]
+        Spacer(Modifier.height(14.dp))
+
+        // Page pager with left/right arrows.
+        Row(
+          Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.Center,
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          OutlinedButton(
+            onClick = { if (safeSelected > 0) selectedPage = safeSelected - 1 },
+            enabled = safeSelected > 0,
+            shape = RoundedCornerShape(8.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+          ) { Text("‹", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = theme.text) }
+          Spacer(Modifier.width(12.dp))
+          Text(
+            "Page ${safeSelected + 1} of ${pages.size}",
+            fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = theme.text
+          )
+          Spacer(Modifier.width(12.dp))
+          OutlinedButton(
+            onClick = { if (safeSelected < pages.lastIndex) selectedPage = safeSelected + 1 },
+            enabled = safeSelected < pages.lastIndex,
+            shape = RoundedCornerShape(8.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+          ) { Text("›", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = theme.text) }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        // Main area: vertical toolbar on the LEFT + the selected page.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          // Vertical toolbar, PC-style sidebar.
+          Column(
+            Modifier
+              .width(60.dp)
+              .clip(RoundedCornerShape(12.dp))
+              .background(theme.card)
+              .border(1.dp, theme.cardBorder, RoundedCornerShape(12.dp))
+              .padding(vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+          ) {
+            val toolbarItems = listOf(
+              Triple("📷", "Retake") {
+                pages = pages.filterIndexed { i, _ -> i != safeSelected }
+                selectedPage = (safeSelected - 1).coerceAtLeast(0)
+                requestCameraOrLaunch()
+              },
+              Triple("◫", "Crop") { cropIndex = safeSelected },
+              Triple("↻", "Rotate") {
+                replacePage(safeSelected, ImagePageEditor.rotate90(page.bitmap), closeCrop = true)
+              },
+              Triple("✦", "Filters") {
+                val next = (filterMode + 1) % filterNames.size
+                filterMode = next
+                replacePage(safeSelected, ImagePageEditor.applyFilter(page.bitmap, next), closeCrop = true)
+                Toast.makeText(ctx, "Filter: ${filterNames[next]}", Toast.LENGTH_SHORT).show()
+              },
+              Triple("◐", "Adjust") { showAdjust = true },
+              Triple("✎", "Edit text") {
+                if (!ocrBusy) {
+                  ocrBusy = true
+                  scope.launch {
+                    val text = withContext(Dispatchers.IO) { ocrImage(ctx, page.uri) }
+                    ocrText = text.ifBlank { "No text found on this page." }
+                    ocrBusy = false
+                  }
+                }
+              }
+            )
+            toolbarItems.forEach { (glyph, label, action) ->
+              Column(
+                Modifier
+                  .fillMaxWidth()
+                  .clickable {
+                    vibrate()
+                    action()
+                  }
+                  .padding(vertical = 6.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                Text(glyph, fontSize = 18.sp, color = theme.text)
+                Text(label, fontFamily = PixelFont, fontSize = 9.sp, color = theme.textSecondary)
+              }
+            }
+            if (filterMode != 0) {
+              Text(
+                filterNames[filterMode],
+                fontFamily = PixelFont, fontSize = 8.sp, color = theme.primary,
+                modifier = Modifier.padding(horizontal = 4.dp),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+              )
+            }
+          }
+
+          // Selected page with the auto-detected frame.
+          Box(
+            Modifier
+              .weight(1f)
+              .clip(RoundedCornerShape(8.dp))
+              .border(
+                2.dp,
+                if (autoDetect) theme.primary else theme.cardBorder,
+                RoundedCornerShape(8.dp)
+              )
+          ) {
+            Image(
+              bitmap = page.bitmap.asImageBitmap(),
+              contentDescription = "Page ${safeSelected + 1}",
+              modifier = Modifier.fillMaxWidth(),
+              contentScale = ContentScale.FillWidth
+            )
+            if (autoDetect) {
+              // Corner dots of the detected frame.
+              listOf(Alignment.TopStart, Alignment.TopEnd, Alignment.BottomStart, Alignment.BottomEnd).forEach { align ->
+                Box(
+                  Modifier
+                    .align(align)
+                    .offset((-4).dp, (-4).dp)
+                    .size(14.dp)
+                    .clip(CircleShape)
+                    .background(theme.primary)
+                    .border(2.dp, theme.card, CircleShape)
+                )
+              }
+              Box(
+                Modifier
+                  .align(Alignment.TopEnd)
+                  .padding(8.dp)
+                  .clip(RoundedCornerShape(12.dp))
+                  .background(theme.primary)
+                  .padding(horizontal = 8.dp, vertical = 3.dp)
+              ) {
+                Text(
+                  "Auto-detected • Ready ✓",
+                  fontFamily = PixelFont, fontSize = 9.sp, fontWeight = FontWeight.Bold, color = theme.textOnPrimary
+                )
+              }
+            }
+          }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        // Auto-detect / No crop toggle.
+        Row(
+          Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(theme.card)
+            .border(1.dp, theme.cardBorder, RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Text("Auto-detect", fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = theme.text)
+          Spacer(Modifier.width(8.dp))
+          Switch(
+            checked = autoDetect,
+            onCheckedChange = { autoDetect = it },
+            colors = SwitchDefaults.colors(
+              checkedThumbColor = theme.primary,
+              checkedTrackColor = theme.primary.copy(alpha = 0.3f)
+            )
+          )
+          Spacer(Modifier.width(12.dp))
+          Text(
+            "No crop",
+            fontFamily = PixelFont, fontSize = 12.sp,
+            color = if (autoDetect) theme.textSecondary else theme.primary
+          )
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        // Multi-page preview strip: tap a thumbnail to switch pages.
+        Text(
+          "PAGES — TAP TO SWITCH:",
+          fontFamily = PixelFont, fontWeight = FontWeight.Bold,
+          fontSize = 12.sp, color = theme.primaryDark
+        )
+        Spacer(Modifier.height(8.dp))
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+          itemsIndexed(pages) { index, p ->
+            val isSel = index == safeSelected
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+              Box(
+                Modifier
+                  .size(72.dp)
+                  .clip(RoundedCornerShape(8.dp))
+                  .background(theme.card)
+                  .border(
+                    2.dp,
+                    if (isSel) theme.primary else theme.cardBorder,
+                    RoundedCornerShape(8.dp)
+                  )
+                  .clickable { vibrate(); selectedPage = index }
+              ) {
+                Image(
+                  bitmap = p.bitmap.asImageBitmap(),
+                  contentDescription = "Page ${index + 1}",
+                  modifier = Modifier.fillMaxSize(),
+                  contentScale = ContentScale.Crop
+                )
+                if (isSel) {
+                  Box(
+                    Modifier
+                      .align(Alignment.TopEnd)
+                      .offset(4.dp, (-4).dp)
+                      .size(20.dp)
+                      .clip(CircleShape)
+                      .background(theme.primary),
+                    contentAlignment = Alignment.Center
+                  ) {
+                    Text("✓", color = theme.textOnPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                  }
+                }
+              }
+              Spacer(Modifier.height(3.dp))
+              Text(
+                "Page ${index + 1}",
+                fontFamily = PixelFont, fontSize = 10.sp,
+                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
+                color = if (isSel) theme.primary else theme.text
+              )
+              TextButton(
+                onClick = {
+                  vibrate()
+                  pages = pages.filterIndexed { i, _ -> i != index }
+                  selectedPage = (selectedPage - 1).coerceAtLeast(0)
+                },
+                contentPadding = PaddingValues(0.dp)
+              ) {
+                Text("✕ Remove", fontFamily = PixelFont, fontSize = 9.sp, color = theme.textSecondary)
+              }
+            }
+          }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+          "Drag pages in Images to PDF to reorder — here, use the thumbnails above to pick a page, then Crop / Rotate / Filters on the left.",
+          fontFamily = PixelFont, fontSize = 11.sp, color = theme.textSecondary
+        )
       }
 
       Spacer(Modifier.height(16.dp))
@@ -539,24 +948,23 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       resultFile?.let { file ->
         Spacer(Modifier.height(12.dp))
         ResultCard(file, theme)
-        if (tm.askSaveLocation()) {
-          Spacer(Modifier.height(12.dp))
-          Button(
-            onClick = {
-              vibrate()
-              pendingSaveFile = file
-              saveLauncher.launch(file.name)
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("SAVE TO FOLDER…", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
+        Spacer(Modifier.height(12.dp))
+        Button(
+          onClick = {
+            vibrate()
+            pendingSaveFile = file
+            saveLauncher.launch(file.name)
+          },
+          modifier = Modifier.fillMaxWidth().height(48.dp),
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+          shape = RoundedCornerShape(8.dp)
+        ) {
+          Text("SAVE TO FOLDER…", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         }
       }
     }
 
+    // Bottom has ONLY the Save PDF button (Phase 4, point 10).
     Button(
       onClick = {
         vibrate()
@@ -579,7 +987,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   }
 }
 
-// 3. PDF TO IMAGES (WITH PAGE 1 PREVIEW)
+
 @Composable
 fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
@@ -868,19 +1276,17 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         ResultCard(file, theme)
       }
       resultFile?.let { file ->
-        if (tm.askSaveLocation()) {
-          Spacer(Modifier.height(10.dp))
-          PrimaryButton(
-            theme = theme,
-            text = "SAVE TO FOLDER…",
-            height = 48.dp,
-            onClick = {
-              vibrate()
-              pendingSaveFile = file
-              saveLauncher.launch(file.name)
-            }
-          )
-        }
+        Spacer(Modifier.height(10.dp))
+        PrimaryButton(
+          theme = theme,
+          text = "SAVE TO FOLDER…",
+          height = 48.dp,
+          onClick = {
+            vibrate()
+            pendingSaveFile = file
+            saveLauncher.launch(file.name)
+          }
+        )
       }
     }
 
@@ -1015,19 +1421,17 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         ResultCard(file, theme)
       }
       resultFile?.let { file ->
-        if (tm.askSaveLocation()) {
-          Spacer(Modifier.height(10.dp))
-          PrimaryButton(
-            theme = theme,
-            text = "SAVE TO FOLDER…",
-            height = 48.dp,
-            onClick = {
-              vibrate()
-              pendingSaveFile = file
-              saveLauncher.launch(file.name)
-            }
-          )
-        }
+        Spacer(Modifier.height(10.dp))
+        PrimaryButton(
+          theme = theme,
+          text = "SAVE TO FOLDER…",
+          height = 48.dp,
+          onClick = {
+            vibrate()
+            pendingSaveFile = file
+            saveLauncher.launch(file.name)
+          }
+        )
       }
     }
 
@@ -1199,7 +1603,6 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
           )
         }
       }
-
       Spacer(Modifier.height(14.dp))
 
       if (selectedTab == 0) {
@@ -1313,19 +1716,17 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
           ResultCard(file, theme, "image/jpeg")
         }
         imageResultFile?.let { file ->
-          if (tm.askSaveLocation()) {
-            Spacer(Modifier.height(10.dp))
-            PrimaryButton(
-              theme = theme,
-              text = "SAVE TO FOLDER…",
-              height = 48.dp,
-              onClick = {
-                vibrate()
-                pendingSaveFile = file
-                imgSaveLauncher.launch(file.name)
-              }
-            )
-          }
+          Spacer(Modifier.height(10.dp))
+          PrimaryButton(
+            theme = theme,
+            text = "SAVE TO FOLDER…",
+            height = 48.dp,
+            onClick = {
+              vibrate()
+              pendingSaveFile = file
+              imgSaveLauncher.launch(file.name)
+            }
+          )
         }
       } else {
         // PDF TAB CONTENT
@@ -1442,19 +1843,17 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
           ResultCard(file, theme, "application/pdf")
         }
         pdfResultFile?.let { file ->
-          if (tm.askSaveLocation()) {
-            Spacer(Modifier.height(10.dp))
-            PrimaryButton(
-              theme = theme,
-              text = "SAVE TO FOLDER…",
-              height = 48.dp,
-              onClick = {
-                vibrate()
-                pendingSaveFile = file
-                pdfSaveLauncher.launch(file.name)
-              }
-            )
-          }
+          Spacer(Modifier.height(10.dp))
+          PrimaryButton(
+            theme = theme,
+            text = "SAVE TO FOLDER…",
+            height = 48.dp,
+            onClick = {
+              vibrate()
+              pendingSaveFile = file
+              pdfSaveLauncher.launch(file.name)
+            }
+          )
         }
       }
     }
@@ -1985,11 +2384,17 @@ fun OcrScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
 // 10. PDF READER (TOOL 14)
 @Composable
-fun PdfReaderScreen(theme: ChamiTheme, onBack: () -> Unit) {
+fun PdfReaderScreen(
+  theme: ChamiTheme,
+  initialFile: File? = null,
+  onOpenTool: ((String) -> Unit)? = null,
+  onBack: () -> Unit
+) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
-  var pdfUri by remember { mutableStateOf<Uri?>(null) }
+  // Phase 4, point 6: a file tapped in History opens straight here.
+  var pdfUri by remember { mutableStateOf<Uri?>(initialFile?.let { Uri.fromFile(it) }) }
   var totalPages by remember { mutableStateOf(0) }
   var currentPage by remember { mutableStateOf(0) }
   var scale by remember { mutableStateOf(1.5f) }
@@ -2010,6 +2415,14 @@ fun PdfReaderScreen(theme: ChamiTheme, onBack: () -> Unit) {
       totalPages = PdfEngine.pageCount(ctx, selected)
       currentPage = 0
       pageInput = "1"
+    }
+  }
+
+  // Page count for a file opened from History (picker sets it itself).
+  LaunchedEffect(pdfUri) {
+    val u = pdfUri ?: return@LaunchedEffect
+    if (totalPages == 0) {
+      totalPages = withContext(Dispatchers.IO) { PdfEngine.pageCount(ctx, u) }
     }
   }
 
@@ -2103,6 +2516,25 @@ fun PdfReaderScreen(theme: ChamiTheme, onBack: () -> Unit) {
         }
 
         Spacer(Modifier.height(8.dp))
+        // Split / Merge / Compress from the reader (Phase 4, point 6).
+        // Those screens pick their own file in v1.2, so these buttons
+        // open the tool — pick the same file there again.
+        if (onOpenTool != null) {
+          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("SPLIT" to "split", "MERGE" to "merge", "COMPRESS" to "compress").forEach { (label, id) ->
+              OutlinedButton(
+                onClick = { vibrate(); onOpenTool(id) },
+                modifier = Modifier.weight(1f).height(40.dp),
+                shape = RoundedCornerShape(8.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
+              ) {
+                Text(label, fontFamily = PixelFont, color = theme.text, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+              }
+            }
+          }
+          Spacer(Modifier.height(8.dp))
+        }
         if (isLoadingPage) {
           LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
         }
@@ -2635,19 +3067,17 @@ fun ProtectPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       if (resultFile != null) {
         ResultCard(resultFile!!, theme)
 
-        if (tm.askSaveLocation()) {
-          Spacer(Modifier.height(8.dp))
-          PrimaryButton(
-            theme = theme,
-            text = "SAVE TO FOLDER…",
-            height = 48.dp,
-            onClick = {
-              vibrate()
-              pendingSaveFile = resultFile
-              saveLauncher.launch(resultFile!!.name)
-            }
-          )
-        }
+        Spacer(Modifier.height(8.dp))
+        PrimaryButton(
+          theme = theme,
+          text = "SAVE TO FOLDER…",
+          height = 48.dp,
+          onClick = {
+            vibrate()
+            pendingSaveFile = resultFile
+            saveLauncher.launch(resultFile!!.name)
+          }
+        )
 
         OutlinedButton(
           onClick = {
