@@ -469,17 +469,6 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   // page that was selected when the filter was picked.
   LaunchedEffect(safeSelected) { scanOriginal = null; filterMode = 0; showFilters = false }
 
-  // Filters picker: apply to the ORIGINAL page bitmap (never to an
-  // already-filtered one), so Original restores the page exactly.
-  fun applyFilterMode(mode: Int) {
-    val page = pages.getOrNull(safeSelected) ?: return
-    if (scanOriginal == null) scanOriginal = page.bitmap
-    val base = scanOriginal ?: page.bitmap
-    filterMode = mode
-    if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
-    else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
-  }
-
   // Apply an edited bitmap to one page (crop / rotate / filter / adjust):
   // save to a temp file first so the PDF uses the edited image.
   fun replacePage(index: Int, newBitmap: Bitmap, closeCrop: Boolean = true) {
@@ -503,6 +492,19 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       editBusy = false
     }
   }
+  // Filters picker: apply to the ORIGINAL page bitmap (never to an
+  // already-filtered one), so Original restores the page exactly.
+  // NOTE: replacePage must be declared  above this function — local
+  // funs in Kotlin are only visible  after their declaration point.
+  fun applyFilterMode(mode: Int) {
+    val page = pages.getOrNull(safeSelected) ?: return
+    if (scanOriginal == null) scanOriginal = page.bitmap
+    val base = scanOriginal ?: page.bitmap
+    filterMode = mode
+    if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
+    else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
+  }
+
 
   // Camera capture. Each capture APPENDS one page (never replaces).
   val cameraPreviewLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bmp ->
