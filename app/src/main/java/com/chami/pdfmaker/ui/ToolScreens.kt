@@ -17,6 +17,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.unit.Dp
 import com.chami.pdfmaker.ads.AdsManager
 import androidx.compose.foundation.background
@@ -36,11 +39,15 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -271,7 +278,7 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       resultFile = null
       scope.launch(Dispatchers.IO) {
         val added = selected.mapNotNull { uri ->
-          PdfEngine.loadBitmap(ctx, uri, 400)?.let { bmp -> PageItem(uri, bmp) }
+          PdfEngine.loadBitmap(ctx, uri, 1600)?.let { bmp -> PageItem(uri, bmp) }
         }
         withContext(Dispatchers.Main) { pages = pages + added }
       }
@@ -331,6 +338,24 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
       if (pages.isNotEmpty()) {
         Spacer(Modifier.height(14.dp))
+        // BIG preview (Phase 5): the first page, large and easy to see,
+        // before the page list below. Uses the stored full bitmap.
+        Box(
+          Modifier
+            .fillMaxWidth()
+            .height(320.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(theme.card)
+            .border(1.dp, theme.cardBorder, RoundedCornerShape(8.dp))
+        ) {
+          Image(
+            bitmap = pages[0].bitmap.asImageBitmap(),
+            contentDescription = "Preview of page 1",
+            modifier = Modifier.fillMaxSize().padding(4.dp),
+            contentScale = ContentScale.Fit
+          )
+        }
+        Spacer(Modifier.height(12.dp))
         PageList(pages = pages, theme = theme, onPagesChange = { pages = it })
         Spacer(Modifier.height(12.dp))
         Button(
@@ -395,17 +420,17 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 }
 
 // 2. SCAN TO PDF (FIXED CAMERA + RUNTIME PERMISSION + PREVIEW)
-// 2. SCAN TO PDF — Adobe Scan style, Chami green/white (Phase 4, points 9-11).
-// - Capture modes are labels only (Document / Book / ID card / Whiteboard /
-//   Form / Business Card) — they do not change camera behaviour.
-// - Auto-detect is a toggle: when ON, the green detected frame + corner
-//   dots are drawn over the page. There is no ML edge detector in this
-//   project, so the frame defaults to the full page; the real crop
-//   happens in the crop editor (drag the corners there).
-// - Layout v2: vertical toolbar on the LEFT (Retake, Crop, Rotate,
-//   Filters, Adjust, Edit text). Bottom has ONLY the Save PDF button.
-// - Multi-page preview: horizontal thumbnail strip under the main page;
-//   selected page has a green border + green checkmark, tap to switch.
+// 2. SCAN TO PDF — Adobe Scan style, Chami green/white (Phase 5).
+// - NO mode chips and NO text-extraction tool in this screen.
+// - BIG preview fills the screen (weight 1f, ContentScale.Fit) — no
+//   scrolling needed to see the page. Vertical toolbar on the LEFT
+//   (Retake, Crop, Rotate, Filters, Adjust). Bottom: ONLY Save PDF.
+// - Filters picker: Original / B&W / Grayscale / Enhance chips, the
+//   selected one is green with a checkmark, applied to the ORIGINAL
+//   bitmap (so switching back to Original restores it).
+// - Auto-detect edges: luminance bounding-box scan (NOT ML/OpenCV) that
+//   opens the free-crop editor with 4 detected corners to drag.
+// - Thumbnails: tap to switch, HOLD a thumbnail and drag to reorder.
 @Composable
 fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
@@ -415,9 +440,14 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val scope = rememberCoroutineScope()
   var pages by remember { mutableStateOf<List<PageItem>>(emptyList()) }
   var selectedPage by remember { mutableStateOf(0) }
-  var scanMode by remember { mutableStateOf("Document") }
-  var autoDetect by remember { mutableStateOf(true) }
   var filterMode by remember { mutableStateOf(0) }
+  var showFilters by remember { mutableStateOf(false) }
+  // Unfiltered bitmap of the selected page, so filters never stack on
+  // an already-filtered image and Original can restore it.
+  var scanOriginal by remember { mutableStateOf<Bitmap?>(null) }
+  // Detected quad (Auto-detect) handed to the crop editor, if any.
+  var autoQuad by remember { mutableStateOf<List<Offset>?>(null) }
+  val density = LocalDensity.current
   var isProcessing by remember { mutableStateOf(false) }
   var resultFile by remember { mutableStateOf<File?>(null) }
   var pendingSaveFile by remember { mutableStateOf<File?>(null) }
@@ -425,16 +455,29 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   var editBusy by remember { mutableStateOf(false) }
   var showAdjust by remember { mutableStateOf(false) }
   var brightness by remember { mutableStateOf(0f) }
-  var ocrText by remember { mutableStateOf<String?>(null) }
-  var ocrBusy by remember { mutableStateOf(false) }
 
   val safeSelected = selectedPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
-  val filterNames = listOf("Original", "Black & white", "High contrast")
+  val filterNames = listOf("Original", "B&W", "Grayscale", "Enhance")
 
   fun vibrate() {
     if (tm.hapticOn()) {
       try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
     }
+  }
+
+  // Each page starts unfiltered; the stored original belongs to the
+  // page that was selected when the filter was picked.
+  LaunchedEffect(safeSelected) { scanOriginal = null; filterMode = 0; showFilters = false }
+
+  // Filters picker: apply to the ORIGINAL page bitmap (never to an
+  // already-filtered one), so Original restores the page exactly.
+  fun applyFilterMode(mode: Int) {
+    val page = pages.getOrNull(safeSelected) ?: return
+    if (scanOriginal == null) scanOriginal = page.bitmap
+    val base = scanOriginal ?: page.bitmap
+    filterMode = mode
+    if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
+    else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
   }
 
   // Apply an edited bitmap to one page (crop / rotate / filter / adjust):
@@ -482,7 +525,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       resultFile = null
       scope.launch(Dispatchers.IO) {
         val added = selected.mapNotNull { uri ->
-          PdfEngine.loadBitmap(ctx, uri, 800)?.let { bmp -> PageItem(uri, bmp) }
+          PdfEngine.loadBitmap(ctx, uri, 1600)?.let { bmp -> PageItem(uri, bmp) }
         }
         withContext(Dispatchers.Main) { pages = pages + added }
       }
@@ -547,9 +590,10 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       CropEditorDialog(
         bitmap = page.bitmap,
         theme = theme,
-        onApply = { bmp -> replacePage(index, bmp, closeCrop = true) },
-        onDismiss = { if (!editBusy) cropIndex = null },
-        onRotate = { replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) }
+        onApply = { bmp -> scanOriginal = null; replacePage(index, bmp, closeCrop = true) },
+        onDismiss = { if (!editBusy) { cropIndex = null; autoQuad = null } },
+        onRotate = { scanOriginal = null; replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) },
+        initialQuad = autoQuad
       )
     }
   }
@@ -595,68 +639,11 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     )
   }
 
-  // Edit text (OCR) dialog — reads the text off the selected page.
-  if (ocrText != null) {
-    AlertDialog(
-      onDismissRequest = { ocrText = null },
-      title = {
-        Text("TEXT ON THIS PAGE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = theme.text)
-      },
-      text = {
-        Column(Modifier.verticalScroll(rememberScrollState())) {
-          Text(ocrText ?: "", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-        }
-      },
-      confirmButton = {
-        Button(
-          onClick = {
-            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            cm?.setPrimaryClip(ClipData.newPlainText("Chami OCR", ocrText ?: ""))
-            Toast.makeText(ctx, "Text copied", Toast.LENGTH_SHORT).show()
-            ocrText = null
-          },
-          colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
-        ) {
-          Text("COPY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        }
-      },
-      dismissButton = {
-        TextButton(onClick = { ocrText = null }) {
-          Text("CLOSE", fontFamily = PixelFont, color = theme.text)
-        }
-      }
-    )
-  }
-
   ToolScreenContainer("Scan to PDF", theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+    // Phase 5: no vertical scroll here — the preview fills the screen
+    // (weight 1f below) so the page is visible without sliding down.
+    Column(Modifier.weight(1f)) {
       Text("Capture pages one by one with the camera, or pick several images from the gallery. Crop, rotate and reorder pages before making one PDF.", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-      Spacer(Modifier.height(12.dp))
-
-      // Capture modes — labels only, they do not change camera behaviour.
-      LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        items(listOf("Document", "Book", "ID card", "Whiteboard", "Form", "Business Card")) { mode ->
-          val isSel = scanMode == mode
-          Box(
-            Modifier
-              .clip(RoundedCornerShape(16.dp))
-              .background(if (isSel) theme.primary else theme.card)
-              .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-              .clickable { vibrate(); scanMode = mode }
-              .padding(horizontal = 10.dp, vertical = 6.dp),
-            contentAlignment = Alignment.Center
-          ) {
-            Text(
-              mode,
-              fontFamily = PixelFont,
-              fontSize = 11.sp,
-              fontWeight = FontWeight.Bold,
-              color = if (isSel) theme.textOnPrimary else theme.text
-            )
-          }
-        }
-      }
-
       Spacer(Modifier.height(12.dp))
 
       Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -723,8 +710,9 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
         Spacer(Modifier.height(10.dp))
 
-        // Main area: vertical toolbar on the LEFT + the selected page.
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Main area: vertical toolbar on the LEFT + the BIG page preview
+        // (weight 1f — it fills the screen, auto-fitted, no scrolling).
+        Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
           // Vertical toolbar, PC-style sidebar.
           Column(
             Modifier
@@ -744,25 +732,11 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
               },
               Triple("◫", "Crop") { cropIndex = safeSelected },
               Triple("↻", "Rotate") {
+                scanOriginal = null
                 replacePage(safeSelected, ImagePageEditor.rotate90(page.bitmap), closeCrop = true)
               },
-              Triple("✦", "Filters") {
-                val next = (filterMode + 1) % filterNames.size
-                filterMode = next
-                replacePage(safeSelected, ImagePageEditor.applyFilter(page.bitmap, next), closeCrop = true)
-                Toast.makeText(ctx, "Filter: ${filterNames[next]}", Toast.LENGTH_SHORT).show()
-              },
-              Triple("◐", "Adjust") { showAdjust = true },
-              Triple("✎", "Edit text") {
-                if (!ocrBusy) {
-                  ocrBusy = true
-                  scope.launch {
-                    val text = withContext(Dispatchers.IO) { ocrImage(ctx, page.uri) }
-                    ocrText = text.ifBlank { "No text found on this page." }
-                    ocrBusy = false
-                  }
-                }
-              }
+              Triple("✦", "Filters") { showFilters = !showFilters },
+              Triple("◐", "Adjust") { showAdjust = true }
             )
             toolbarItems.forEach { (glyph, label, action) ->
               Column(
@@ -789,85 +763,94 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
             }
           }
 
-          // Selected page with the auto-detected frame.
+          // Selected page — BIG, full-size, auto-fitted (ContentScale.Fit
+          // on the stored full bitmap; gallery loads are 1600px, see above).
           Box(
             Modifier
               .weight(1f)
+              .fillMaxSize()
               .clip(RoundedCornerShape(8.dp))
-              .border(
-                2.dp,
-                if (autoDetect) theme.primary else theme.cardBorder,
-                RoundedCornerShape(8.dp)
-              )
+              .background(theme.card)
+              .border(1.dp, theme.cardBorder, RoundedCornerShape(8.dp))
           ) {
             Image(
               bitmap = page.bitmap.asImageBitmap(),
               contentDescription = "Page ${safeSelected + 1}",
-              modifier = Modifier.fillMaxWidth(),
-              contentScale = ContentScale.FillWidth
+              modifier = Modifier.fillMaxSize().padding(4.dp),
+              contentScale = ContentScale.Fit
             )
-            if (autoDetect) {
-              // Corner dots of the detected frame.
-              listOf(Alignment.TopStart, Alignment.TopEnd, Alignment.BottomStart, Alignment.BottomEnd).forEach { align ->
-                Box(
-                  Modifier
-                    .align(align)
-                    .offset((-4).dp, (-4).dp)
-                    .size(14.dp)
-                    .clip(CircleShape)
-                    .background(theme.primary)
-                    .border(2.dp, theme.card, CircleShape)
-                )
+          }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        // Auto-detect edges (Phase 5): finds the document bounds and
+        // opens the free-crop editor with the 4 detected corners.
+        Row(
+          Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(8.dp),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          OutlinedButton(
+            onClick = {
+              vibrate()
+              val pg = pages.getOrNull(safeSelected)
+              if (pg != null) {
+                autoQuad = ImagePageEditor.detectDocumentQuad(pg.bitmap)
+                cropIndex = safeSelected
               }
+            },
+            modifier = Modifier.weight(1f).height(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
+          ) {
+            Text("AUTO-DETECT EDGES", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = theme.text)
+          }
+          Text(
+            "Drag the 4 corners in the crop editor",
+            fontFamily = PixelFont, fontSize = 10.sp, color = theme.textSecondary,
+            modifier = Modifier.weight(1f)
+          )
+        }
+
+        // Filters picker (Phase 5): the SELECTED filter is green with a
+        // checkmark, and it is really applied (to the original bitmap).
+        if (showFilters) {
+          Spacer(Modifier.height(10.dp))
+          LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            itemsIndexed(filterNames) { fIndex, fName ->
+              val isSel = filterMode == fIndex
               Box(
                 Modifier
-                  .align(Alignment.TopEnd)
-                  .padding(8.dp)
-                  .clip(RoundedCornerShape(12.dp))
-                  .background(theme.primary)
-                  .padding(horizontal = 8.dp, vertical = 3.dp)
+                  .clip(RoundedCornerShape(16.dp))
+                  .background(if (isSel) theme.primary else theme.card)
+                  .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
+                  .clickable {
+                    vibrate()
+                    applyFilterMode(fIndex)
+                  }
+                  .padding(horizontal = 12.dp, vertical = 8.dp),
+                contentAlignment = Alignment.Center
               ) {
                 Text(
-                  "Auto-detected • Ready ✓",
-                  fontFamily = PixelFont, fontSize = 9.sp, fontWeight = FontWeight.Bold, color = theme.textOnPrimary
+                  if (isSel) "✓ $fName" else fName,
+                  fontFamily = PixelFont,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = if (isSel) theme.textOnPrimary else theme.text
                 )
               }
             }
           }
         }
 
-        Spacer(Modifier.height(10.dp))
-
-        // Auto-detect / No crop toggle.
-        Row(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .background(theme.card)
-            .border(1.dp, theme.cardBorder, RoundedCornerShape(10.dp))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          Text("Auto-detect", fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = theme.text)
-          Spacer(Modifier.width(8.dp))
-          Switch(
-            checked = autoDetect,
-            onCheckedChange = { autoDetect = it },
-            colors = SwitchDefaults.colors(
-              checkedThumbColor = theme.primary,
-              checkedTrackColor = theme.primary.copy(alpha = 0.3f)
-            )
-          )
-          Spacer(Modifier.width(12.dp))
-          Text(
-            "No crop",
-            fontFamily = PixelFont, fontSize = 12.sp,
-            color = if (autoDetect) theme.textSecondary else theme.primary
-          )
-        }
-
         Spacer(Modifier.height(12.dp))
 
+        // Multi-page preview strip (hidden once the PDF is made, so the
+        // result card has room): tap to switch, HOLD a thumbnail and
+        // drag it left/right to reorder.
+        if (resultFile == null) {
         // Multi-page preview strip: tap a thumbnail to switch pages.
         Text(
           "PAGES — TAP TO SWITCH:",
@@ -878,10 +861,33 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
           itemsIndexed(pages) { index, p ->
             val isSel = index == safeSelected
+            var dragOffsetX by remember { mutableStateOf(0f) }
+            val dragThresholdPx = with(density) { 96.dp.toPx() }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
               Box(
                 Modifier
-                  .size(72.dp)
+                  .size(96.dp)
+                  .graphicsLayer { translationX = dragOffsetX }
+                  // Phase 5: hold the THUMBNAIL itself, then drag it.
+                  .pointerInput(index) {
+                    detectDragGesturesAfterLongPress(
+                      onDrag = { change, dragAmount ->
+                        change.consume()
+                        dragOffsetX += dragAmount.x
+                        if (dragOffsetX > dragThresholdPx && index < pages.lastIndex) {
+                          pages = ImagePageEditor.move(pages, index, index + 1)
+                          selectedPage = index + 1
+                          dragOffsetX = 0f
+                        } else if (dragOffsetX < -dragThresholdPx && index > 0) {
+                          pages = ImagePageEditor.move(pages, index, index - 1)
+                          selectedPage = index - 1
+                          dragOffsetX = 0f
+                        }
+                      },
+                      onDragEnd = { dragOffsetX = 0f },
+                      onDragCancel = { dragOffsetX = 0f }
+                    )
+                  }
                   .clip(RoundedCornerShape(8.dp))
                   .background(theme.card)
                   .border(
@@ -931,11 +937,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
             }
           }
         }
-        Spacer(Modifier.height(8.dp))
-        Text(
-          "Drag pages in Images to PDF to reorder — here, use the thumbnails above to pick a page, then Crop / Rotate / Filters on the left.",
-          fontFamily = PixelFont, fontSize = 11.sp, color = theme.textSecondary
-        )
+        }
       }
 
       Spacer(Modifier.height(16.dp))
@@ -1014,7 +1016,7 @@ fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
         val n = PdfEngine.pageCount(ctx, selected)
-        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 1.0f)
+        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 2.0f)
         withContext(Dispatchers.Main) {
           totalPages = n
           pageOnePreview = bmp
@@ -1058,7 +1060,7 @@ fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
             contentDescription = "Page 1 Preview",
             modifier = Modifier
               .fillMaxWidth()
-              .heightIn(max = 220.dp)
+              .heightIn(max = 420.dp)
               .clip(RoundedCornerShape(6.dp)),
             contentScale = ContentScale.Fit
           )
@@ -1162,7 +1164,7 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   fun loadPreviewForPage(page: Int) {
     val u = pdfUri ?: return
     scope.launch(Dispatchers.IO) {
-      val bmp = PdfReader.renderPageBitmap(ctx, u, page - 1, 1.0f)
+      val bmp = PdfReader.renderPageBitmap(ctx, u, page - 1, 2.0f)
       withContext(Dispatchers.Main) { pagePreviewBitmap = bmp }
     }
   }
@@ -1175,7 +1177,7 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
         val n = PdfEngine.pageCount(ctx, selected)
-        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 1.0f)
+        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 2.0f)
         withContext(Dispatchers.Main) {
           totalPages = n
           for (i in 1..n) selectedPages.add(i)
@@ -1213,7 +1215,7 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
             val isPreviewing = previewPageIndex == p
             Box(
               Modifier
-                .size(44.dp)
+                .size(56.dp)
                 .clip(RoundedCornerShape(6.dp))
                 .background(if (isSelected) theme.primary else theme.card)
                 .border(if (isPreviewing) 2.dp else 0.dp, theme.primaryDark, RoundedCornerShape(6.dp))
@@ -1254,7 +1256,7 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
               contentDescription = "Page $previewPageIndex",
               modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 200.dp)
+                .heightIn(max = 420.dp)
                 .clip(RoundedCornerShape(6.dp)),
               contentScale = ContentScale.Fit
             )
@@ -1351,7 +1353,7 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     scope.launch(Dispatchers.IO) {
       val previews = selected.map { u ->
         val count = PdfEngine.pageCount(ctx, u)
-        val bmp = PdfReader.renderPageBitmap(ctx, u, 0, 0.8f)
+        val bmp = PdfReader.renderPageBitmap(ctx, u, 0, 1.5f)
         Pair(count, bmp)
       }
       withContext(Dispatchers.Main) { pdfPreviews = previews }
@@ -1386,7 +1388,7 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
             Column(
               horizontalAlignment = Alignment.CenterHorizontally,
               modifier = Modifier
-                .width(110.dp)
+                .width(140.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .background(theme.card)
                 .padding(8.dp)
@@ -1396,7 +1398,7 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
                   bitmap = bmp.asImageBitmap(),
                   contentDescription = "PDF ${index + 1}",
                   modifier = Modifier
-                    .size(90.dp)
+                    .size(120.dp)
                     .clip(RoundedCornerShape(4.dp)),
                   contentScale = ContentScale.Fit
                 )
@@ -1520,7 +1522,7 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
     imageBitmap = null
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
-        val bmp = PdfEngine.loadBitmap(ctx, selected, 600)
+        val bmp = PdfEngine.loadBitmap(ctx, selected, 1200)
         var size = 0L
         try {
           ctx.contentResolver.openInputStream(selected)?.use { size = it.available() / 1024L }
@@ -1541,7 +1543,7 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
       scope.launch(Dispatchers.IO) {
         val bytes = PdfCompress.originalSizeBytes(ctx, selected)
         val pages = PdfEngine.pageCount(ctx, selected)
-        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 0.8f)
+        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 1.5f)
         withContext(Dispatchers.Main) {
           pdfOrigBytes = bytes
           pdfTotalPages = pages
@@ -1603,6 +1605,7 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
           )
         }
       }
+
       Spacer(Modifier.height(14.dp))
 
       if (selectedTab == 0) {
@@ -1624,27 +1627,26 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
           Spacer(Modifier.height(14.dp))
           Text("ORIGINAL IMAGE PREVIEW:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
           Spacer(Modifier.height(6.dp))
-          Row(
+          Column(
             modifier = Modifier
               .fillMaxWidth()
               .clip(RoundedCornerShape(8.dp))
               .background(theme.card)
               .padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically
+            horizontalAlignment = Alignment.CenterHorizontally
           ) {
             Image(
               bitmap = imageBitmap!!.asImageBitmap(),
               contentDescription = "Original Preview",
               modifier = Modifier
-                .size(70.dp)
+                .fillMaxWidth()
+                .height(320.dp)
                 .clip(RoundedCornerShape(6.dp)),
-              contentScale = ContentScale.Crop
+              contentScale = ContentScale.Fit
             )
-            Spacer(Modifier.width(12.dp))
-            Column {
-              Text("Current Size: ${if (imageOrigKb > 0) "$imageOrigKb KB" else "Ready"}", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text, fontWeight = FontWeight.Bold)
-              Text("Target: $targetKb KB", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark)
-            }
+            Spacer(Modifier.height(8.dp))
+            Text("Current Size: ${if (imageOrigKb > 0) "$imageOrigKb KB" else "Ready"}", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text, fontWeight = FontWeight.Bold)
+            Text("Target: $targetKb KB", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark)
           }
         }
 
@@ -1758,7 +1760,7 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
                 bitmap = bmp.asImageBitmap(),
                 contentDescription = "PDF Preview",
                 modifier = Modifier
-                  .size(70.dp)
+                  .size(120.dp)
                   .clip(RoundedCornerShape(6.dp)),
                 contentScale = ContentScale.Fit
               )
@@ -2110,7 +2112,7 @@ fun ResizeConvertScreen(theme: ChamiTheme, title: String = "Image Resizer", onBa
     previewBitmap = null
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
-        val bmp = PdfEngine.loadBitmap(ctx, selected, 600)
+        val bmp = PdfEngine.loadBitmap(ctx, selected, 1200)
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         try {
           ctx.contentResolver.openInputStream(selected)?.use { BitmapFactory.decodeStream(it, null, opts) }
@@ -2147,29 +2149,28 @@ fun ResizeConvertScreen(theme: ChamiTheme, title: String = "Image Resizer", onBa
         Spacer(Modifier.height(14.dp))
         Text("IMAGE PREVIEW:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
         Spacer(Modifier.height(6.dp))
-        Row(
+        Column(
           modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
             .background(theme.card)
             .padding(10.dp),
-          verticalAlignment = Alignment.CenterVertically
+          horizontalAlignment = Alignment.CenterHorizontally
         ) {
           Image(
             bitmap = previewBitmap!!.asImageBitmap(),
             contentDescription = "Resize Preview",
             modifier = Modifier
-              .size(70.dp)
+              .fillMaxWidth()
+              .height(320.dp)
               .clip(RoundedCornerShape(6.dp)),
-            contentScale = ContentScale.Crop
+            contentScale = ContentScale.Fit
           )
-          Spacer(Modifier.width(12.dp))
-          Column {
-            origDimensions?.let { (w, h) ->
-              Text("Original: ${w}x$h px", fontFamily = PixelFont, fontSize = 10.sp, color = theme.text)
-            }
-            Text("Target: ${widthStr}x${heightStr} px ($formatChoice)", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark, fontWeight = FontWeight.Bold)
+          Spacer(Modifier.height(8.dp))
+          origDimensions?.let { (w, h) ->
+            Text("Original: ${w}x$h px", fontFamily = PixelFont, fontSize = 10.sp, color = theme.text)
           }
+          Text("Target: ${widthStr}x${heightStr} px ($formatChoice)", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark, fontWeight = FontWeight.Bold)
         }
       }
 
@@ -2283,7 +2284,7 @@ fun OcrScreen(theme: ChamiTheme, onBack: () -> Unit) {
     previewBitmap = null
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
-        val bmp = PdfEngine.loadBitmap(ctx, selected, 600)
+        val bmp = PdfEngine.loadBitmap(ctx, selected, 1200)
         withContext(Dispatchers.Main) { previewBitmap = bmp }
       }
     }
@@ -2316,7 +2317,7 @@ fun OcrScreen(theme: ChamiTheme, onBack: () -> Unit) {
           contentDescription = "OCR Preview",
           modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 180.dp)
+            .heightIn(max = 380.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(theme.card),
           contentScale = ContentScale.Fit
@@ -2397,11 +2398,20 @@ fun PdfReaderScreen(
   var pdfUri by remember { mutableStateOf<Uri?>(initialFile?.let { Uri.fromFile(it) }) }
   var totalPages by remember { mutableStateOf(0) }
   var currentPage by remember { mutableStateOf(0) }
-  var scale by remember { mutableStateOf(1.5f) }
+  // Phase 5: render at 2x so pages stay sharp when zoomed in.
+  var scale by remember { mutableStateOf(2.0f) }
   var isNightMode by remember { mutableStateOf(false) }
   var pageInput by remember { mutableStateOf("1") }
   var currentBitmap by remember { mutableStateOf<Bitmap?>(null) }
   var isLoadingPage by remember { mutableStateOf(false) }
+  // Pinch-to-zoom state (Drive-like): zoom is the display zoom on the
+  // already-rendered bitmap; pan moves the zoomed page. Reset on page
+  // change so a new page always starts fitted.
+  var zoom by remember { mutableStateOf(1f) }
+  var pan by remember { mutableStateOf(Offset.Zero) }
+  // Rendered page bitmaps are cached per page (in memory only) so
+  // going back a page does not re-render it.
+  val pageBitmapCache = remember { mutableStateMapOf<Int, Bitmap>() }
 
   fun vibrate() {
     if (tm.hapticOn()) {
@@ -2426,12 +2436,21 @@ fun PdfReaderScreen(
     }
   }
 
+  // Reset display zoom/pan whenever the page changes.
+  LaunchedEffect(currentPage) { zoom = 1f; pan = Offset.Zero }
+
   LaunchedEffect(pdfUri, currentPage, scale) {
     val u = pdfUri ?: return@LaunchedEffect
+    pageBitmapCache[currentPage]?.let { cached ->
+      currentBitmap = cached
+      isLoadingPage = false
+      return@LaunchedEffect
+    }
     isLoadingPage = true
     withContext(Dispatchers.IO) {
       val bmp = PdfReader.renderPageBitmap(ctx, u, currentPage, scale)
       withContext(Dispatchers.Main) {
+        if (bmp != null) pageBitmapCache[currentPage] = bmp
         currentBitmap = bmp
         isLoadingPage = false
       }
@@ -2441,9 +2460,9 @@ fun PdfReaderScreen(
   ToolScreenContainer("PDF Reader", theme, onBack) {
     if (pdfUri == null) {
       Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("Inbuilt 1-page-at-a-time Reader", fontFamily = PixelFont, fontSize = 14.sp, color = theme.text)
+        Text("PDF Reader", fontFamily = PixelFont, fontSize = 14.sp, color = theme.text)
         Spacer(Modifier.height(8.dp))
-        Text("Zero lag on 4GB RAM. Never loads all pages at once.", fontFamily = PixelFont, fontSize = 11.sp, color = theme.primaryDark)
+        Text("Pinch to zoom, swipe through pages. One page at a time, so large files stay smooth.", fontFamily = PixelFont, fontSize = 11.sp, color = theme.primaryDark)
         Spacer(Modifier.height(20.dp))
         Button(
           onClick = {
@@ -2486,17 +2505,20 @@ fun PdfReaderScreen(
             Button(
               onClick = {
                 vibrate()
-                if (scale > 1.0f) scale -= 0.5f
+                zoom = (zoom - 0.25f).coerceIn(0.5f, 4f)
+                if (zoom == 1f) pan = Offset.Zero
               },
               colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
               shape = RoundedCornerShape(6.dp),
               contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
             ) { Text("-", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 14.sp) }
             Spacer(Modifier.width(4.dp))
+            Text("${(zoom * 100).toInt()}%", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = theme.text)
+            Spacer(Modifier.width(4.dp))
             Button(
               onClick = {
                 vibrate()
-                if (scale < 3.0f) scale += 0.5f
+                zoom = (zoom + 0.25f).coerceIn(0.5f, 4f)
               },
               colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
               shape = RoundedCornerShape(6.dp),
@@ -2512,6 +2534,28 @@ fun PdfReaderScreen(
               shape = RoundedCornerShape(6.dp),
               contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
             ) { Text(if (isNightMode) "☀️" else "🌙", fontSize = 12.sp) }
+          }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        // Zoom slider (same zoom as pinch / +/- above).
+        Row(
+          Modifier.fillMaxWidth(),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Text("ZOOM", fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = theme.textSecondary)
+          Slider(
+            value = zoom,
+            onValueChange = {
+              zoom = it
+              if (zoom == 1f) pan = Offset.Zero
+            },
+            valueRange = 0.5f..4f,
+            modifier = Modifier.weight(1f),
+            colors = SliderDefaults.colors(thumbColor = theme.primary, activeTrackColor = theme.primary)
+          )
+          TextButton(onClick = { zoom = 1f; pan = Offset.Zero }) {
+            Text("FIT", fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = theme.primary)
           }
         }
 
@@ -2539,25 +2583,85 @@ fun PdfReaderScreen(
           LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
         }
 
+        // Page view (Phase 5, Drive-like): dark background, page fitted
+        // to the screen, pinch to zoom + drag to pan, double-tap toggles
+        // between fit (1x) and 2.5x zoom. Rendered at 2x, so zooming
+        // stays sharp; the bitmap is cached per page (see above).
         Box(
           Modifier
             .weight(1f)
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(if (isNightMode) Color.Black else Color.LightGray)
-            .verticalScroll(rememberScrollState()),
+            .background(Color(0xFF121212)),
           contentAlignment = Alignment.Center
         ) {
           currentBitmap?.let { bmp ->
             Image(
               bitmap = bmp.asImageBitmap(),
               contentDescription = "Page ${currentPage + 1}",
-              modifier = Modifier.padding(8.dp)
+              modifier = Modifier
+                .fillMaxSize()
+                .padding(8.dp)
+                .graphicsLayer(
+                  scaleX = zoom,
+                  scaleY = zoom,
+                  translationX = pan.x,
+                  translationY = pan.y
+                )
+                .pointerInput(Unit) {
+                  detectTransformGestures { _, panChange, zoomChange, _ ->
+                    zoom = (zoom * zoomChange).coerceIn(0.5f, 4f)
+                    pan += panChange
+                    if (zoom == 1f) pan = Offset.Zero
+                  }
+                }
+                .pointerInput(Unit) {
+                  detectTapGestures(
+                    onDoubleTap = {
+                      if (zoom > 1f) { zoom = 1f; pan = Offset.Zero }
+                      else zoom = 2.5f
+                    }
+                  )
+                },
+              contentScale = ContentScale.Fit
             )
           }
         }
 
         Spacer(Modifier.height(8.dp))
+        // Jump to page: numbered chips (tap a page to open it).
+        if (totalPages > 1) {
+          LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth()
+          ) {
+            items((1..totalPages).toList()) { p ->
+              val isSel = p - 1 == currentPage
+              Box(
+                Modifier
+                  .size(40.dp)
+                  .clip(RoundedCornerShape(6.dp))
+                  .background(if (isSel) theme.primary else theme.card)
+                  .border(1.dp, theme.cardBorder, RoundedCornerShape(6.dp))
+                  .clickable {
+                    vibrate()
+                    currentPage = p - 1
+                    pageInput = "$p"
+                  },
+                contentAlignment = Alignment.Center
+              ) {
+                Text(
+                  "$p",
+                  fontFamily = PixelFont,
+                  fontSize = 11.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = if (isSel) theme.textOnPrimary else theme.text
+                )
+              }
+            }
+          }
+          Spacer(Modifier.height(8.dp))
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
           Button(
             onClick = {
@@ -2624,7 +2728,7 @@ fun PdfToTextScreen(theme: ChamiTheme, onBack: () -> Unit) {
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
         val n = PdfEngine.pageCount(ctx, selected)
-        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 1.0f)
+        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 2.0f)
         withContext(Dispatchers.Main) {
           totalPages = n
           previewBitmap = bmp
@@ -2660,7 +2764,7 @@ fun PdfToTextScreen(theme: ChamiTheme, onBack: () -> Unit) {
           contentDescription = "PDF Page 1 Preview",
           modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 180.dp)
+            .heightIn(max = 380.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(theme.card),
           contentScale = ContentScale.Fit
@@ -2778,9 +2882,7 @@ fun ProtectPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   fun vibrate() {
     if (tm.hapticOn()) {
-      try {
-        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-      } catch (_: Exception) {}
+      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
     }
   }
 
