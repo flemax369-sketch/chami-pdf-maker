@@ -81,8 +81,4 @@ class ThemeManager(ctx: Context) {
     p.edit().putBoolean("haptic", v).apply()
   }
 
-  fun askSaveLocation(): Boolean = p.getBoolean("ask_save", true)
-  fun setAskSaveLocation(v: Boolean) {
-    p.edit().putBoolean("ask_save", v).apply()
-  }
 }
