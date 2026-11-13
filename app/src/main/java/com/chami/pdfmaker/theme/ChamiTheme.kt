@@ -66,14 +66,19 @@ object ChamiThemes {
   }
 }
 
-// ThemeManager - SharedPreferences only, fast, safe, survives app restarts.
+// Phase 6 — THEME LOCK: Executive Emerald is the only theme.
+// current() always returns emerald_pro no matter what is saved, and
+// set() forces emerald_pro instead of storing the requested id.
+// The Obsidian theme object is kept so old references still compile,
+// but it can no longer be selected.
 class ThemeManager(ctx: Context) {
   private val p = ctx.getSharedPreferences("chami_theme", Context.MODE_PRIVATE)
 
-  fun current(): ChamiTheme = ChamiThemes.byId(p.getString("theme_id", "emerald_pro") ?: "emerald_pro")
+  fun current(): ChamiTheme = ChamiThemes.EMERALD_PRO
 
   fun set(id: String) {
-    p.edit().putString("theme_id", id).apply()
+    // No-op by design (Phase 6): theme is locked to Executive Emerald.
+    p.edit().putString("theme_id", "emerald_pro").apply()
   }
 
   // Phase 5: haptic is ALWAYS ON — there is no toggle in Settings any
