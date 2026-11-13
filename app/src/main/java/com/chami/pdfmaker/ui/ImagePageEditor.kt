@@ -17,6 +17,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -483,7 +484,9 @@ fun CropEditorDialog(
           return Offset((a.x + b.x) / 2f, (a.y + b.y) / 2f)
         }
 
-        // The displayed image, exactly dispW x dispH, centred in the box.
+                // The displayed image, exactly dispW x dispH, centred in the box.
+        // The zoom scale is applied to this whole Box (image + quad +
+        // handles together) so the frame never lies when zoomed (H4).
         Box(
           modifier = Modifier
             .offset { IntOffset(offXPx.roundToInt(), offYPx.roundToInt()) }
@@ -491,6 +494,7 @@ fun CropEditorDialog(
               width = with(density) { dispW.toDp() },
               height = with(density) { dispH.toDp() }
             )
+            .graphicsLayer(scaleX = zoom, scaleY = zoom)
             .pointerInput(bitmap) {
               detectTransformGestures { _, _, zoomChange, _ ->
                 zoom = (zoom * zoomChange).coerceIn(1f, 3f)
@@ -500,7 +504,7 @@ fun CropEditorDialog(
           Image(
             bitmap = bitmap.asImageBitmap(),
             contentDescription = "Page to crop",
-            modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = zoom, scaleY = zoom),
+            modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.FillBounds
           )
 
@@ -587,42 +591,44 @@ fun CropEditorDialog(
             }
           }
 
-          // MAGNIFIER LOUPE: while a corner/edge handle is dragged, a
-          // circular 2x zoomed view of the area around the finger,
-          // positioned above the finger (clamped inside the image area).
-          activeHandle?.let { handle ->
-            val focus = if (handle < 4) quad[handle] else edgeMid(handle - 4)
-            val fx = focus.x * dispW
-            val fy = focus.y * dispH
-            val loupePx = with(density) { 120.dp.toPx() }
-            val half = loupePx / 2f
-            val loupeX = (fx - half).coerceIn(0f, (dispW - loupePx).coerceAtLeast(0f))
-            val loupeY = (fy - loupePx - with(density) { 24.dp.toPx() }).coerceIn(0f, (dispH - loupePx).coerceAtLeast(0f))
-            Box(
-              Modifier
-                .offset { IntOffset(loupeX.roundToInt(), loupeY.roundToInt()) }
-                .size(120.dp)
-                .clip(CircleShape)
-                .background(Color.Black)
-                .border(2.dp, Color.White, CircleShape)
-            ) {
-              Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier
-                  .size(
-                    width = with(density) { (dispW * 2f).toDp() },
-                    height = with(density) { (dispH * 2f).toDp() }
+                  }
+
+        // MAGNIFIER LOUPE: while a corner/edge handle is dragged, a
+        // circular 2x zoomed view of the area around the finger,
+        // positioned above the finger (clamped inside the image area).
+        // Sits OUTSIDE the zoomed Box so the pinch scale does not move it.
+        activeHandle?.let { handle ->
+          val focus = if (handle < 4) quad[handle] else edgeMid(handle - 4)
+          val fx = focus.x * dispW
+          val fy = focus.y * dispH
+          val loupePx = with(density) { 120.dp.toPx() }
+          val half = loupePx / 2f
+          val loupeX = (fx - half).coerceIn(0f, (dispW - loupePx).coerceAtLeast(0f))
+          val loupeY = (fy - loupePx - with(density) { 24.dp.toPx() }).coerceIn(0f, (dispH - loupePx).coerceAtLeast(0f))
+          Box(
+            Modifier
+              .offset { IntOffset((offXPx + loupeX).roundToInt(), (offYPx + loupeY).roundToInt()) }
+              .size(120.dp)
+              .clip(CircleShape)
+              .background(Color.Black)
+              .border(2.dp, Color.White, CircleShape)
+          ) {
+            Image(
+              bitmap = bitmap.asImageBitmap(),
+              contentDescription = null,
+              modifier = Modifier
+                .size(
+                  width = with(density) { (dispW * 2f).toDp() },
+                  height = with(density) { (dispH * 2f).toDp() }
+                )
+                .offset {
+                  IntOffset(
+                    (half - fx * 2f).roundToInt(),
+                    (half - fy * 2f).roundToInt()
                   )
-                  .offset {
-                    IntOffset(
-                      (half - fx * 2f).roundToInt(),
-                      (half - fy * 2f).roundToInt()
-                    )
-                  },
-                contentScale = ContentScale.FillBounds
-              )
-            }
+                },
+              contentScale = ContentScale.FillBounds
+            )
           }
         }
       }
