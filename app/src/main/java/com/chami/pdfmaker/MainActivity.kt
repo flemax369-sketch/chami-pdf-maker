@@ -71,6 +71,7 @@ class MainActivity : ComponentActivity() {
       var unlocked by remember { mutableStateOf(!appLockOn || savedPin.length != 4) }
       var pinInput by remember { mutableStateOf("") }
       var pinError by remember { mutableStateOf(false) }
+      var showForgotPin by remember { mutableStateOf(false) }
 
       fun vibrate() {
         if (tm.hapticOn()) {
@@ -220,10 +221,66 @@ class MainActivity : ComponentActivity() {
             ) {
               Text(
                 "UNLOCK",
+              fontFamily = PixelFont,
+              color = theme.textOnPrimary,
+              fontSize = 13.sp,
+              fontWeight = FontWeight.Bold
+            )
+          }
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = { showForgotPin = true }) {
+              Text(
+                "Forgot PIN?",
                 fontFamily = PixelFont,
-                color = theme.textOnPrimary,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold
+                fontSize = 12.sp,
+                color = theme.textSecondary
+              )
+            }
+            // Forgot PIN recovery (H1): without this, a forgotten PIN
+            // bricked the app — the only escape was Clear data. Removing
+            // the lock here is explicit and confirmed, and the user must
+            // set a new PIN in Settings to lock the app again.
+            if (showForgotPin) {
+              AlertDialog(
+                onDismissRequest = { showForgotPin = false },
+                title = {
+                  Text(
+                    "Remove App Lock?",
+                    fontFamily = PixelFont,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp
+                  )
+                },
+                text = {
+                  Text(
+                    "This removes the App Lock PIN. Set a new PIN in Settings to lock the app again.",
+                    fontSize = 13.sp
+                  )
+                },
+                confirmButton = {
+                  Button(
+                    onClick = {
+                      lockPrefs.edit().remove("app_lock").remove("app_pin").apply()
+                      showForgotPin = false
+                      unlocked = true
+                      Toast.makeText(ctx, "App Lock removed", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+                  ) {
+                    Text(
+                      "REMOVE LOCK",
+                      fontFamily = PixelFont,
+                      color = theme.textOnPrimary,
+                      fontSize = 12.sp,
+                      fontWeight = FontWeight.Bold
+                    )
+                  }
+                },
+                dismissButton = {
+                  TextButton(onClick = { showForgotPin = false }) {
+                    Text("CANCEL", fontFamily = PixelFont, fontSize = 12.sp)
+                  }
+                }
               )
             }
           }
