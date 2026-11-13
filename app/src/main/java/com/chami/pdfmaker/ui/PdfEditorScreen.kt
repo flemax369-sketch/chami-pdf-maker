@@ -72,7 +72,6 @@ import androidx.compose.ui.unit.IntSize
 import kotlin.math.roundToInt
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.chami.pdfmaker.ads.AdsManager
 import com.chami.pdfmaker.pdf.Annotation
 import com.chami.pdfmaker.pdf.PageRef
 import com.chami.pdfmaker.pdf.PdfEditorEngine
@@ -411,7 +410,8 @@ fun PdfEditorScreen(theme: ChamiTheme, onBack: () -> Unit) {
     val uri = pdfUri ?: return
     // Phase 1 ad hook: the file is built AFTER the ad closes (or
     // immediately if no ad is ready). The save is never blocked.
-    AdsManager.showBeforeSave(activity) {
+    // Phase 6: ads removed — build directly, no interstitial.
+        run {
       isProcessing = true
       scope.launch {
         val out = PdfEngine.outFile(ctx, "Edited_${System.currentTimeMillis()}.pdf")
