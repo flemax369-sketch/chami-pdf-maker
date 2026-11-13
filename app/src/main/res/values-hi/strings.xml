@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">होम</string>
+    <string name="history">इतिहास</string>
+    <string name="settings">सेटिंग्स</string>
+    <string name="simple_tools">सरल टूल्स</string>
+    <string name="smart_tools">स्मार्ट टूल्स</string>
+    <string name="images_to_pdf">इमेज से PDF</string>
+    <string name="scan_to_pdf">स्कैन से PDF</string>
+    <string name="merge_pdf">PDF मिलाएँ</string>
+    <string name="split_pdf">PDF अलग करें</string>
+    <string name="protect_pdf">PDF सुरक्षित करें</string>
+    <string name="compress_kb">KB कम करें</string>
+    <string name="pdf_to_images">PDF से इमेज</string>
+    <string name="image_resizer">इमेज रिसाइज़र</string>
+    <string name="pdf_reader">PDF रीडर</string>
+    <string name="format_convert">फ़ॉर्मेट बदलें</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">बदलें</string>
+    <string name="save_pdf">PDF सहेजें</string>
+    <string name="done">हो गया</string>
+    <string name="language">भाषा</string>
+    <string name="contact_support">सहायता से संपर्क करें</string>
+    <string name="check_updates">अपडेट देखें</string>
+    <string name="storage">स्टोरेज</string>
+    <string name="app_lock">ऐप लॉक</string>
+    <string name="background">बैकग्राउंड</string>
+    <string name="font_size">फ़ॉन्ट आकार</string>
+    <string name="clear_cache">कैश साफ़ करें</string>
+    <string name="privacy_policy">गोपनीयता नीति</string>
+</resources>
