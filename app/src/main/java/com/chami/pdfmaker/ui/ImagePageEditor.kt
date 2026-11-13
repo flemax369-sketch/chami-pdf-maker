@@ -34,7 +34,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.lazy.scrollBy
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -781,14 +780,14 @@ fun PageList(
             detectDragGesturesAfterLongPress(
               onDragStart = {
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                draggingIndexState.value = latestPages.value.indexOfFirst { it.uri == page.uri }
+                draggingIndexState.value = latestPages.indexOfFirst { it.uri == page.uri }
                 dragOffsetXState.value = 0f
               },
               onDrag = { change, dragAmount ->
                 change.consume()
                 dragOffsetXState.value += dragAmount.x
                 val cur = draggingIndexState.value ?: return@detectDragGesturesAfterLongPress
-                val current = latestPages.value
+                val current = latestPages
                 // Auto-scroll the LazyRow at the edges while dragging.
                 val info = listState.layoutInfo
                 val firstVisible = info.visibleItemsInfo.firstOrNull()?.index ?: 0
