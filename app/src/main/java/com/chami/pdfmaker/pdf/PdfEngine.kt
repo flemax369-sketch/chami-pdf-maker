@@ -159,6 +159,102 @@ object PdfEngine {
     } catch(e:Exception) { false }
   }
 
+  // Phase 6 — IMAGES TO PDF WITH OPTIONS (page size / page numbers /
+  // watermark / quality). quality is a JPEG quality 10..95:
+  // High 95 / Medium 75 / Low 50. pageSize: "A4" (595x842),
+  // "Letter" (612x792) or "Original" (one page per image, sized to the
+  // image itself). Returns false if there is nothing to write.
+  fun imagesToPdfWithOptions(
+    ctx: Context,
+    uris: List<Uri>,
+    outFile: File,
+    pageSize: String,
+    pageNumbers: Boolean,
+    watermark: String?,
+    quality: Int
+  ): Boolean {
+    if (uris.isEmpty()) return false
+    val q = quality.coerceIn(10, 95)
+    return try {
+      val doc = PdfDocument()
+      var pageNo = 1
+      uris.forEach { uri ->
+        val raw = loadBitmap(ctx, uri) ?: return@forEach
+        // Apply the quality setting: JPEG round-trip at the chosen
+        // quality, then decode again for drawing.
+        val bmp = recompressAtQuality(raw, q)
+        if (bmp !== raw) raw.recycle()
+        val (pw, ph) = when (pageSize) {
+          "Letter" -> Pair(612, 792)
+          "Original" -> Pair(bmp.width.coerceAtLeast(1), bmp.height.coerceAtLeast(1))
+          else -> Pair(595, 842) // "A4" and any unknown value
+        }
+        val pageInfo = PdfDocument.PageInfo.Builder(pw, ph, pageNo).create()
+        val page = doc.startPage(pageInfo)
+        val c = page.canvas
+        c.drawColor(Color.WHITE)
+        if (pageSize == "Original") {
+          c.drawBitmap(bmp, null, RectF(0f, 0f, pw.toFloat(), ph.toFloat()), null)
+        } else {
+          val scale = minOf((pw - 72f) / bmp.width, (ph - 72f) / bmp.height)
+          val w = bmp.width * scale; val h = bmp.height * scale
+          val dst = RectF((pw - w) / 2, (ph - h) / 2, (pw + w) / 2, (ph + h) / 2)
+          c.drawBitmap(bmp, null, dst, null)
+        }
+        if (!watermark.isNullOrBlank()) {
+          val wmPaint = Paint().apply {
+            color = Color.argb(90, 0x64, 0x74, 0x8B)
+            textSize = 48f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+          }
+          c.save()
+          c.rotate(-45f, pw / 2f, ph / 2f)
+          c.drawText(watermark, pw / 2f, ph / 2f, wmPaint)
+          c.restore()
+        }
+        if (pageNumbers) {
+          val numPaint = Paint().apply {
+            color = Color.rgb(0x64, 0x74, 0x8B); textSize = 12f
+            textAlign = Paint.Align.CENTER
+          }
+          c.drawText("Page $pageNo", pw / 2f, ph - 18f, numPaint)
+        }
+        doc.finishPage(page)
+        bmp.recycle()
+        pageNo++
+      }
+      if (pageNo == 1) { doc.close(); return false }
+      FileOutputStream(outFile).use { doc.writeTo(it) }; doc.close(); true
+    } catch (e: Exception) { e.printStackTrace(); false }
+  }
+
+  // JPEG round-trip at the given quality. Returns the original bitmap
+  // unchanged if the round-trip fails.
+  private fun recompressAtQuality(bmp: Bitmap, quality: Int): Bitmap {
+    return try {
+      val baos = ByteArrayOutputStream()
+      bmp.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+      val bytes = baos.toByteArray()
+      BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: bmp
+    } catch (e: Exception) { bmp }
+  }
+
+  // Phase 6 — COMPRESS IMAGES INSIDE A PDF without changing the text.
+  // Honest limit: android.graphics.pdf has no PDF object parser, so
+  // embedded image streams cannot be recompressed in place with the
+  // libraries in this project. This is a best-effort version: it
+  // re-renders each page at the requested JPEG quality (same engine as
+  // PdfCompress, full scale, exact quality) which shrinks image-heavy
+  // PDFs; text becomes rasterised, exactly like the existing
+  // PdfCompress.compressPdf. Returns false on failure.
+  fun compressPdfImages(ctx: Context, input: File, out: File, quality: Int): Boolean {
+    if (!input.exists()) return false
+    val preset = PdfCompressPreset("Custom", 1.0f, quality.coerceIn(10, 95))
+    val result = PdfCompress.compressPdf(ctx, Uri.fromFile(input), preset, out)
+    return result.ok
+  }
+
   fun outFile(ctx:Context, name:String): File {
     val dir=File(ctx.getExternalFilesDir(null),"Chami"); if(!dir.exists()) dir.mkdirs()
     return File(dir,name)
