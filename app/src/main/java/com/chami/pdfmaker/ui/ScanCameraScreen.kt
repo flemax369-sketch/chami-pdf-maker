@@ -2,7 +2,8 @@ package com.chami.pdfmaker.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.BitmapFactory
+import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -59,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.chami.pdfmaker.pdf.PdfEngine
 import com.chami.pdfmaker.theme.ChamiTheme
 import java.io.File
 
@@ -101,6 +103,7 @@ fun ScanCameraScreen(
     PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
   }
   var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
+  var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
   var cameraReady by remember { mutableStateOf(false) }
   var flashOn by remember { mutableStateOf(false) }
   var autoFired by remember { mutableStateOf(false) }
@@ -109,6 +112,10 @@ fun ScanCameraScreen(
   // takePhoto / bindCamera are declared here, before the effects below.
   fun takePhoto() {
     val capture = imageCapture ?: return
+    // Mark fired here (not in the timer): a manual tap also cancels the
+    // pending auto-capture, and a failed early return never consumes
+    // the one auto shot (H6).
+    autoFired = true
     val tmp = File(ctx.cacheDir, "scan_${System.currentTimeMillis()}.jpg")
     val options = ImageCapture.OutputFileOptions.Builder(tmp).build()
     capture.takePicture(
@@ -116,13 +123,16 @@ fun ScanCameraScreen(
       ContextCompat.getMainExecutor(ctx),
       object : ImageCapture.OnImageSavedCallback {
         override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-          val bmp = BitmapFactory.decodeFile(tmp.absolutePath)
+          // Downsample to ~1600 px max side: a full 12 MP capture is
+          // ~48 MB per page and batch scanning would OOM (H7).
+          val bmp = PdfEngine.loadBitmap(ctx, Uri.fromFile(tmp), 1600)
           if (bmp != null) onCaptured(bmp)
+          else Toast.makeText(ctx, "Capture failed — try again", Toast.LENGTH_SHORT).show()
           try { tmp.delete() } catch (_: Exception) {}
         }
 
         override fun onError(e: ImageCaptureException) {
-          // Stay on the camera; the user can tap capture again.
+          Toast.makeText(ctx, "Capture failed — try again", Toast.LENGTH_SHORT).show()
         }
       }
     )
@@ -134,6 +144,7 @@ fun ScanCameraScreen(
       {
         try {
           val provider = providerFuture.get()
+          cameraProvider = provider
           val preview = Preview.Builder().build().also {
             it.setSurfaceProvider(view.surfaceProvider)
           }
@@ -165,12 +176,12 @@ fun ScanCameraScreen(
   }
 
   // Auto-capture: once the preview has been steady ~2.5s, capture once.
-  // Guarded so it fires at most once per camera open.
+  // Guarded so it fires at most once per camera open. takePhoto() sets
+  // autoFired, so a manual capture cancels the pending timer (H6).
   LaunchedEffect(cameraReady, autoCapture) {
     if (autoCapture && cameraReady && !autoFired) {
       kotlinx.coroutines.delay(2500)
       if (!autoFired) {
-        autoFired = true
         takePhoto()
       }
     }
@@ -180,6 +191,12 @@ fun ScanCameraScreen(
   LaunchedEffect(flashOn) {
     imageCapture?.flashMode =
       if (flashOn) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF
+  }
+
+  // Release the camera when leaving this screen, or it stays held
+  // (battery drain, blocks other apps) until the Activity dies (H2).
+  androidx.compose.runtime.DisposableEffect(Unit) {
+    onDispose { try { cameraProvider?.unbindAll() } catch (_: Exception) {} }
   }
 
   val pulse by rememberInfiniteTransition(label = "edgeFramePulse").animateFloat(
