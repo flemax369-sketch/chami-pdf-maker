@@ -149,6 +149,7 @@ object PdfProtector {
 
       val pageBitmaps = mutableListOf<ByteArray>()
       val pageDimensions = mutableListOf<Pair<Int, Int>>()
+      val pageImageDims = mutableListOf<Pair<Int, Int>>()
 
       for (i in 0 until pageCount) {
         val page = renderer.openPage(i)
@@ -170,13 +171,17 @@ object PdfProtector {
         bmp.recycle()
         pageBitmaps.add(baos.toByteArray())
         pageDimensions.add(Pair(w, h))
+        // The XObject /Width /Height must be the JPEG's real pixel size
+        // (bw x bh), NOT the page size — otherwise viewers render the
+        // image stretched/corrupt whenever scale != 1.
+        pageImageDims.add(Pair(bw, bh))
         progressCallback(i + 1, pageCount)
       }
       renderer.close()
       pfd.close()
 
       // Now build encrypted PDF
-      writeEncryptedPdf(pageBitmaps, pageDimensions, enc, docId, outFile)
+      writeEncryptedPdf(pageBitmaps, pageDimensions, pageImageDims, enc, docId, outFile)
       true
     } catch (e: Exception) {
       e.printStackTrace()
@@ -196,6 +201,7 @@ object PdfProtector {
 
       val pageBitmaps = mutableListOf<ByteArray>()
       val pageDimensions = mutableListOf<Pair<Int, Int>>()
+      val pageImageDims = mutableListOf<Pair<Int, Int>>()
 
       for (uri in uris) {
         val bmp = PdfEngine.loadBitmap(ctx, uri, 1800) ?: continue
@@ -210,10 +216,12 @@ object PdfProtector {
         val a4h = 842
         pageBitmaps.add(baos.toByteArray())
         pageDimensions.add(Pair(a4w, a4h))
+        // XObject dict needs the JPEG's real pixel size, not the page size.
+        pageImageDims.add(Pair(w, h))
       }
 
       if (pageBitmaps.isEmpty()) return false
-      writeEncryptedPdf(pageBitmaps, pageDimensions, enc, docId, outFile)
+      writeEncryptedPdf(pageBitmaps, pageDimensions, pageImageDims, enc, docId, outFile)
       true
     } catch (e: Exception) {
       e.printStackTrace()
@@ -224,6 +232,7 @@ object PdfProtector {
   private fun writeEncryptedPdf(
     pageImages: List<ByteArray>,
     dimensions: List<Pair<Int, Int>>,
+    imageDimensions: List<Pair<Int, Int>>,
     enc: EncryptionParams,
     docId: ByteArray,
     outFile: File
@@ -318,7 +327,7 @@ object PdfProtector {
       val key = objectKey(enc.encryptionKey, imgObj)
       val encJpg = RC4(key).process(rawJpg)
 
-      val (pw, ph) = dimensions[i]
+      val (pw, ph) = imageDimensions[i]
       startObj(imgObj)
       writeString(
         "<< /Type /XObject /Subtype /Image /Width $pw /Height $ph " +
@@ -465,6 +474,7 @@ object PdfProtector {
       if (pageCount == 0) { renderer.close(); pfd.close(); return false }
       val pageBitmaps = mutableListOf<ByteArray>()
       val pageDimensions = mutableListOf<Pair<Int, Int>>()
+      val pageImageDims = mutableListOf<Pair<Int, Int>>()
       for (i in 0 until pageCount) {
         val page = renderer.openPage(i)
         val w = page.width
@@ -480,12 +490,13 @@ object PdfProtector {
         bmp.recycle()
         pageBitmaps.add(baos.toByteArray())
         pageDimensions.add(Pair(w, h))
+        pageImageDims.add(Pair((w * scale).toInt(), (h * scale).toInt()))
       }
       renderer.close()
       pfd.close()
       val docId = md5(UUID.randomUUID().toString().toByteArray())
       val enc = computeEncryptionParams(password, "", docId, pVal)
-      writeEncryptedPdf(pageBitmaps, pageDimensions, enc, docId, out)
+      writeEncryptedPdf(pageBitmaps, pageDimensions, pageImageDims, enc, docId, out)
       true
     } catch (e: Exception) {
       e.printStackTrace()
