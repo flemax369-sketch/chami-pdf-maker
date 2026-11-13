@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">Главная</string>
+    <string name="history">История</string>
+    <string name="settings">Настройки</string>
+    <string name="simple_tools">ПРОСТЫЕ ИНСТРУМЕНТЫ</string>
+    <string name="smart_tools">УМНЫЕ ИНСТРУМЕНТЫ</string>
+    <string name="images_to_pdf">Изображения в PDF</string>
+    <string name="scan_to_pdf">Сканировать в PDF</string>
+    <string name="merge_pdf">Объединить PDF</string>
+    <string name="split_pdf">Разделить PDF</string>
+    <string name="protect_pdf">Защитить PDF</string>
+    <string name="compress_kb">Сжать KB</string>
+    <string name="pdf_to_images">PDF в изображения</string>
+    <string name="image_resizer">Изменить размер</string>
+    <string name="pdf_reader">Чтение PDF</string>
+    <string name="format_convert">Сменить формат</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">Конвертировать</string>
+    <string name="save_pdf">Сохранить PDF</string>
+    <string name="done">Готово</string>
+    <string name="language">Язык</string>
+    <string name="contact_support">Связаться с поддержкой</string>
+    <string name="check_updates">Проверить обновления</string>
+    <string name="storage">Хранилище</string>
+    <string name="app_lock">Блокировка приложения</string>
+    <string name="background">Фон</string>
+    <string name="font_size">Размер шрифта</string>
+    <string name="clear_cache">Очистить кэш</string>
+    <string name="privacy_policy">Политика конфиденциальности</string>
+</resources>
