@@ -1,6 +1,7 @@
 package com.chami.pdfmaker.ui
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import androidx.compose.foundation.Image
@@ -38,6 +39,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import com.chami.pdfmaker.LocaleHelper
 import com.chami.pdfmaker.pdf.ShareHelper
 import com.chami.pdfmaker.theme.*
 import java.io.File
@@ -139,6 +144,11 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
+  // Phase 6 Font Size: "font_scale" in chami_prefs (0.85 / 1.0 / 1.15).
+  // Main History text sizes are multiplied by it (read fresh each
+  // composition so a change in Settings applies on the next visit).
+  val fontScale = ctx.getSharedPreferences(LocaleHelper.PREFS, Context.MODE_PRIVATE)
+    .getFloat("font_scale", 1.0f)
   val favPrefs = remember { ctx.getSharedPreferences("chami_history_favs", Context.MODE_PRIVATE) }
   // Phase 5 FLICKER FIX: the file list is loaded SYNCHRONOUSLY here,
   // before the first composition, instead of starting empty and filling
@@ -276,16 +286,16 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
   ) {
     // Title — smaller, consistent hierarchy (Phase 4, point 7).
     Text(
-      text = "History",
+      text = LocaleHelper.t(ctx, "history"),
       fontFamily = PixelFont,
       fontWeight = FontWeight.ExtraBold,
-      fontSize = 20.sp,
+      fontSize = (20f * fontScale).sp,
       color = theme.text
     )
     Text(
       text = "${fileList.size} documents saved",
       fontFamily = PixelFont,
-      fontSize = 12.sp,
+      fontSize = (12f * fontScale).sp,
       color = theme.textSecondary
     )
 
@@ -301,7 +311,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       Text(
         "Storage used: ${formatKb(storageUsed)}",
         fontFamily = PixelFont,
-        fontSize = 12.sp,
+        fontSize = (12f * fontScale).sp,
         color = theme.textSecondary
       )
     }
@@ -517,7 +527,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                 entry.title,
                 fontFamily = PixelFont,
                 fontWeight = FontWeight.Bold,
-                fontSize = 13.sp,
+                fontSize = (13f * fontScale).sp,
                 color = theme.primary,
                 modifier = Modifier.padding(top = 4.dp)
               )
@@ -579,7 +589,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                       file.name,
                       fontFamily = PixelFont,
                       fontWeight = FontWeight.Bold,
-                      fontSize = 15.sp,
+                      fontSize = (15f * fontScale).sp,
                       color = theme.text,
                       maxLines = 1
                     )
@@ -591,7 +601,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                         append(" • ${sdf.format(Date(file.lastModified()))}")
                       },
                       fontFamily = PixelFont,
-                      fontSize = 12.sp,
+                      fontSize = (12f * fontScale).sp,
                       color = theme.textSecondary
                     )
                   }
@@ -764,7 +774,6 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
   }
 }
 
-
 @Composable
 fun SettingsScreen(
   theme: ChamiTheme,
@@ -775,15 +784,103 @@ fun SettingsScreen(
   val haptic = LocalHapticFeedback.current
   // Phase 5: no haptic toggle any more — haptic is always on
   // (ThemeManager.hapticOn() now always returns true).
+  // Phase 6: THEME picker removed entirely — the theme is locked to
+  // Executive Emerald (emerald_pro) in MainActivity. onThemeChanged is
+  // kept only so the existing call site still compiles; it is never used.
+  val prefs = remember { ctx.getSharedPreferences(LocaleHelper.PREFS, Context.MODE_PRIVATE) }
+  // Phase 6 Font Size: "font_scale" in chami_prefs (0.85 / 1.0 / 1.15).
+  var fontScale by remember { mutableStateOf(prefs.getFloat("font_scale", 1.0f)) }
 
   var showClearCacheDialog by remember { mutableStateOf(false) }
   var showPrivacyPolicy by remember { mutableStateOf(false) }
+  var showLanguageDialog by remember { mutableStateOf(false) }
+  var showBackgroundDialog by remember { mutableStateOf(false) }
+  var showFontSizeDialog by remember { mutableStateOf(false) }
+  var showPinSetupDialog by remember { mutableStateOf(false) }
+  var pinSetupText by remember { mutableStateOf("") }
+  var pinSetupError by remember { mutableStateOf(false) }
+  var appLockOn by remember { mutableStateOf(prefs.getBoolean("app_lock", false)) }
+  var bgKey by remember { mutableStateOf(prefs.getString("home_bg", "default") ?: "default") }
+
+  // Phase 6 Storage: real size of the app's Chami output folder.
+  val storageUsedBytes = remember {
+    val dir = File(ctx.getExternalFilesDir(null), "Chami")
+    if (dir.exists()) dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } else 0L
+  }
 
   fun vibrate() {
     // Haptic is always on (no toggle) — always give the tap feedback.
     try {
       haptic.performHapticFeedback(HapticFeedbackType.LongPress)
     } catch (_: Exception) {}
+  }
+
+  fun openSupportEmail() {
+    try {
+      val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:chami.support@gmail.com"))
+      ctx.startActivity(intent)
+    } catch (_: Exception) {
+      Toast.makeText(ctx, "No email app found", Toast.LENGTH_SHORT).show()
+    }
+  }
+
+  val bgOptions = listOf(
+    "default" to "Default White",
+    "grass" to "Pixel Grass",
+    "sky" to "Pixel Sky",
+    "night" to "Pixel Night",
+    "sunset" to "Pixel Sunset"
+  )
+  val fontOptions = listOf(
+    "Small" to 0.85f,
+    "Medium" to 1.0f,
+    "Large" to 1.15f
+  )
+
+  @Composable
+  fun SettingsRow(
+    title: String,
+    value: String? = null,
+    showSwitch: Boolean = false,
+    switchOn: Boolean = false,
+    onSwitchChange: ((Boolean) -> Unit)? = null,
+    onClick: () -> Unit
+  ) {
+    Row(
+      Modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(12.dp))
+        .clickable { vibrate(); onClick() }
+        .padding(horizontal = 12.dp, vertical = 14.dp),
+      verticalAlignment = Alignment.CenterVertically
+    ) {
+      Text(
+        title,
+        fontFamily = PixelFont,
+        fontSize = (14f * fontScale).sp,
+        fontWeight = FontWeight.SemiBold,
+        color = theme.text,
+        modifier = Modifier.weight(1f)
+      )
+      if (showSwitch) {
+        Switch(
+          checked = switchOn,
+          onCheckedChange = { onSwitchChange?.invoke(it) },
+          colors = SwitchDefaults.colors(checkedThumbColor = theme.textOnPrimary, checkedTrackColor = theme.primary)
+        )
+      } else {
+        if (value != null) {
+          Text(
+            value,
+            fontFamily = PixelFont,
+            fontSize = (12f * fontScale).sp,
+            color = theme.textSecondary
+          )
+          Spacer(Modifier.width(8.dp))
+        }
+        Text("›", fontSize = 18.sp, color = theme.textSecondary)
+      }
+    }
   }
 
   Column(
@@ -793,133 +890,87 @@ fun SettingsScreen(
       .verticalScroll(rememberScrollState())
   ) {
     Text(
-      text = "Settings",
+      text = LocaleHelper.t(ctx, "settings"),
       fontFamily = PixelFont,
       fontWeight = FontWeight.ExtraBold,
-      fontSize = 16.sp,
+      fontSize = (16f * fontScale).sp,
       color = theme.text
-    )
-    Text(
-      text = "Appearance and security",
-      fontFamily = PixelFont,
-      fontSize = 12.sp,
-      color = theme.textSecondary
     )
 
     Spacer(Modifier.height(18.dp))
 
-    // SECTION 1: THEME & COLOR PALETTE
-    Text(
-      "THEME",
-      fontFamily = PixelFont,
-      fontWeight = FontWeight.Bold,
-      fontSize = 12.sp,
-      color = theme.primary
-    )
-    Spacer(Modifier.height(8.dp))
-
+    // Phase 6 Settings rows — clean rows, title only, minimal subtext.
     Column(
       Modifier
         .fillMaxWidth()
         .clip(RoundedCornerShape(16.dp))
         .background(theme.card)
         .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-        .padding(8.dp),
-      verticalArrangement = Arrangement.spacedBy(6.dp)
+        .padding(4.dp),
+      verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-      ChamiThemes.ALL.forEach { th ->
-        val isSelected = th.id == theme.id
-        Row(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (isSelected) th.primary.copy(alpha = 0.1f) else Color.Transparent)
-            .border(
-              width = if (isSelected) 1.5.dp else 0.dp,
-              color = if (isSelected) th.primary else Color.Transparent,
-              shape = RoundedCornerShape(12.dp)
-            )
-            .clickable {
-              vibrate()
-              tm.set(th.id)
-              onThemeChanged(th)
-            }
-            .padding(12.dp),
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          // Color Preview Swatch
-          Row(
-            Modifier
-              .size(36.dp)
-              .clip(RoundedCornerShape(8.dp))
-              .background(th.bg)
-              .border(1.dp, th.cardBorder, RoundedCornerShape(8.dp)),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-          ) {
-            Box(
-              Modifier
-                .size(16.dp)
-                .clip(CircleShape)
-                .background(th.primary)
-            )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "language"),
+        value = LocaleHelper.LANGUAGES.firstOrNull { it.first == LocaleHelper.currentCode(ctx) }?.second,
+        onClick = { showLanguageDialog = true }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "contact_support"),
+        value = "chami.support@gmail.com",
+        onClick = { openSupportEmail() }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "check_updates"),
+        value = "1.2",
+        onClick = {
+          Toast.makeText(ctx, "You are on the latest version 1.2", Toast.LENGTH_SHORT).show()
+        }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "storage"),
+        value = "Storage used: ${formatKb(storageUsedBytes)}",
+        onClick = {
+          Toast.makeText(ctx, "Storage used: ${formatKb(storageUsedBytes)}", Toast.LENGTH_SHORT).show()
+        }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "app_lock"),
+        showSwitch = true,
+        switchOn = appLockOn,
+        onSwitchChange = { wantOn ->
+          if (wantOn) {
+            pinSetupText = ""
+            pinSetupError = false
+            showPinSetupDialog = true
+          } else {
+            prefs.edit().putBoolean("app_lock", false).apply()
+            appLockOn = false
+            Toast.makeText(ctx, "App Lock OFF", Toast.LENGTH_SHORT).show()
           }
-
-          Spacer(Modifier.width(12.dp))
-
-          Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Text(
-                th.name,
-                fontFamily = PixelFont,
-                fontSize = 13.sp,
-                color = theme.text,
-                fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold
-              )
-              if (th.isDark) {
-                Spacer(Modifier.width(6.dp))
-                Box(
-                  Modifier
-                    .clip(RoundedCornerShape(4.dp))
-                    .background(theme.cardBorder)
-                    .padding(horizontal = 4.dp, vertical = 1.dp)
-                ) {
-                  Text("DARK", fontFamily = PixelFont, fontSize = 9.sp, color = theme.textSecondary)
-                }
-              }
-            }
-            Spacer(Modifier.height(2.dp))
-            Text(
-              th.subtitle,
-              fontFamily = PixelFont,
-              fontSize = 11.sp,
-              color = theme.textSecondary,
-              maxLines = 1
-            )
-          }
-
-          if (isSelected) {
-            Box(
-              Modifier
-                .clip(CircleShape)
-                .background(th.primary)
-                .size(22.dp),
-              contentAlignment = Alignment.Center
-            ) {
-              Text("✓", color = th.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-            }
+        },
+        onClick = {
+          if (!appLockOn) {
+            pinSetupText = ""
+            pinSetupError = false
+            showPinSetupDialog = true
           }
         }
-      }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "background"),
+        value = bgOptions.firstOrNull { it.first == bgKey }?.second,
+        onClick = { showBackgroundDialog = true }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "font_size"),
+        value = fontOptions.firstOrNull { it.second == fontScale }?.first,
+        onClick = { showFontSizeDialog = true }
+      )
     }
 
     Spacer(Modifier.height(20.dp))
 
-    Spacer(Modifier.height(20.dp))
-
-    Spacer(Modifier.height(16.dp))
-
-    // SECTION 4: STORAGE & PRIVACY
+    // STORAGE & PRIVACY buttons (kept from before).
     Row(
       Modifier.fillMaxWidth(),
       horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -935,10 +986,10 @@ fun SettingsScreen(
         colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
       ) {
         Text(
-          "CLEAR CACHE",
+          LocaleHelper.t(ctx, "clear_cache").uppercase(),
           fontFamily = PixelFont,
           color = theme.text,
-          fontSize = 11.sp,
+          fontSize = (11f * fontScale).sp,
           fontWeight = FontWeight.Bold
         )
       }
@@ -954,10 +1005,10 @@ fun SettingsScreen(
         colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
       ) {
         Text(
-          "PRIVACY POLICY",
+          LocaleHelper.t(ctx, "privacy_policy").uppercase(),
           fontFamily = PixelFont,
           color = theme.text,
-          fontSize = 11.sp,
+          fontSize = (11f * fontScale).sp,
           fontWeight = FontWeight.Bold
         )
       }
@@ -980,19 +1031,219 @@ fun SettingsScreen(
         "Version 1.2",
         fontFamily = PixelFont,
         fontWeight = FontWeight.Bold,
-        fontSize = 14.sp,
+        fontSize = (14f * fontScale).sp,
         color = theme.text
       )
       Spacer(Modifier.height(3.dp))
       Text(
         "Easy. Faster. Safe.",
         fontFamily = PixelFont,
-        fontSize = 12.sp,
+        fontSize = (12f * fontScale).sp,
         color = theme.textSecondary
       )
     }
 
     Spacer(Modifier.height(24.dp))
+
+    // Dialog: Language — tapping a language switches immediately.
+    if (showLanguageDialog) {
+      AlertDialog(
+        onDismissRequest = { showLanguageDialog = false },
+        confirmButton = {},
+        dismissButton = {
+          TextButton(onClick = { showLanguageDialog = false }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text(LocaleHelper.t(ctx, "language"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          Column {
+            LocaleHelper.LANGUAGES.forEach { (code, name) ->
+              val isCurrent = code == LocaleHelper.currentCode(ctx)
+              Row(
+                Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(8.dp))
+                  .clickable {
+                    vibrate()
+                    showLanguageDialog = false
+                    LocaleHelper.setLocale(ctx, code)
+                  }
+                  .padding(vertical = 10.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                Text(
+                  name,
+                  fontFamily = PixelFont,
+                  fontSize = 14.sp,
+                  fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
+                  color = if (isCurrent) theme.primary else theme.text,
+                  modifier = Modifier.weight(1f)
+                )
+                if (isCurrent) Text("✓", fontSize = 14.sp, color = theme.primary, fontWeight = FontWeight.Bold)
+              }
+            }
+          }
+        }
+      )
+    }
+
+    // Dialog: Background — stored in chami_prefs "home_bg", used as a
+    // tint/colour on the Home screen in MainActivity.
+    if (showBackgroundDialog) {
+      AlertDialog(
+        onDismissRequest = { showBackgroundDialog = false },
+        confirmButton = {},
+        dismissButton = {
+          TextButton(onClick = { showBackgroundDialog = false }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text(LocaleHelper.t(ctx, "background"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          Column {
+            bgOptions.forEach { (key, name) ->
+              val isCurrent = key == bgKey
+              Row(
+                Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(8.dp))
+                  .clickable {
+                    vibrate()
+                    prefs.edit().putString("home_bg", key).apply()
+                    bgKey = key
+                    showBackgroundDialog = false
+                    Toast.makeText(ctx, "Background set: $name", Toast.LENGTH_SHORT).show()
+                  }
+                  .padding(vertical = 10.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                Text(
+                  name,
+                  fontFamily = PixelFont,
+                  fontSize = 14.sp,
+                  fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
+                  color = if (isCurrent) theme.primary else theme.text,
+                  modifier = Modifier.weight(1f)
+                )
+                if (isCurrent) Text("✓", fontSize = 14.sp, color = theme.primary, fontWeight = FontWeight.Bold)
+              }
+            }
+          }
+        }
+      )
+    }
+
+    // Dialog: Font Size — stored in chami_prefs "font_scale".
+    if (showFontSizeDialog) {
+      AlertDialog(
+        onDismissRequest = { showFontSizeDialog = false },
+        confirmButton = {},
+        dismissButton = {
+          TextButton(onClick = { showFontSizeDialog = false }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text(LocaleHelper.t(ctx, "font_size"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          Column {
+            fontOptions.forEach { (name, scale) ->
+              val isCurrent = scale == fontScale
+              Row(
+                Modifier
+                  .fillMaxWidth()
+                  .clip(RoundedCornerShape(8.dp))
+                  .clickable {
+                    vibrate()
+                    prefs.edit().putFloat("font_scale", scale).apply()
+                    fontScale = scale
+                    showFontSizeDialog = false
+                  }
+                  .padding(vertical = 10.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+              ) {
+                Text(
+                  name,
+                  fontFamily = PixelFont,
+                  fontSize = 14.sp,
+                  fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
+                  color = if (isCurrent) theme.primary else theme.text,
+                  modifier = Modifier.weight(1f)
+                )
+                if (isCurrent) Text("✓", fontSize = 14.sp, color = theme.primary, fontWeight = FontWeight.Bold)
+              }
+            }
+          }
+        }
+      )
+    }
+
+    // Dialog: App Lock — set a real 4-digit PIN, stored in chami_prefs
+    // "app_pin"; "app_lock" is turned on only once a PIN is saved.
+    // MainActivity shows the PIN entry overlay on start while it is on.
+    if (showPinSetupDialog) {
+      AlertDialog(
+        onDismissRequest = { showPinSetupDialog = false },
+        confirmButton = {
+          Button(
+            onClick = {
+              val pin = pinSetupText.filter { it.isDigit() }
+              if (pin.length == 4) {
+                prefs.edit().putString("app_pin", pin).putBoolean("app_lock", true).apply()
+                appLockOn = true
+                showPinSetupDialog = false
+                Toast.makeText(ctx, "App Lock ON", Toast.LENGTH_SHORT).show()
+              } else {
+                pinSetupError = true
+              }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+          ) {
+            Text("SAVE PIN", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          }
+        },
+        dismissButton = {
+          TextButton(onClick = { showPinSetupDialog = false }) {
+            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+          }
+        },
+        title = {
+          Text("Set a 4-digit PIN", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+          Column {
+            OutlinedTextField(
+              value = pinSetupText,
+              onValueChange = {
+                pinSetupText = it.filter { c -> c.isDigit() }.take(4)
+                pinSetupError = false
+              },
+              singleLine = true,
+              visualTransformation = PasswordVisualTransformation(),
+              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+              isError = pinSetupError,
+              placeholder = { Text("••••", fontFamily = PixelFont, fontSize = 14.sp) },
+              modifier = Modifier.fillMaxWidth()
+            )
+            if (pinSetupError) {
+              Spacer(Modifier.height(6.dp))
+              Text(
+                "Enter exactly 4 digits",
+                fontFamily = PixelFont,
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.error
+              )
+            }
+          }
+        }
+      )
+    }
 
     // Dialog: Clear Cache
     if (showClearCacheDialog) {
