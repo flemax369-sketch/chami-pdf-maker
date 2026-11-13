@@ -23,6 +23,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.ui.unit.Dp
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -30,6 +31,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -62,6 +64,7 @@ import com.chami.pdfmaker.pdf.*
 import com.chami.pdfmaker.theme.ChamiTheme
 import com.chami.pdfmaker.theme.ThemeManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -623,37 +626,74 @@ private fun PageThumbnailStrip(
   onAddPages: () -> Unit
 ) {
   val density = LocalDensity.current
+  val haptic = LocalHapticFeedback.current
+  val scope = rememberCoroutineScope()
+  val listState = rememberLazyListState()
+  // Drag state lives at strip level (not per item): the gesture must
+  // survive a reorder, which changes the dragged item's index (H8).
+  // latestPages/latestOnMove always see the current list inside the
+  // long-running pointerInput block (keyed on page.uri).
+  val latestPages by rememberUpdatedState(pages)
+  val latestOnMove by rememberUpdatedState(onMove)
+  var draggingUri by remember { mutableStateOf<Uri?>(null) }
+  var dragOffsetX by remember { mutableStateOf(0f) }
+  val cardPx = with(density) { 96.dp.toPx() }
+  val gapPx = with(density) { 10.dp.toPx() }
+  val cardFullPx = cardPx + gapPx
   LazyRow(
+    state = listState,
     horizontalArrangement = Arrangement.spacedBy(10.dp),
     modifier = Modifier.fillMaxWidth()
   ) {
     itemsIndexed(pages, key = { _, page -> page.uri.toString() }) { index, page ->
       val isSel = index == selectedIndex
-      var dragOffsetX by remember { mutableStateOf(0f) }
-      val dragThresholdPx = with(density) { 96.dp.toPx() }
+      val isDragging = draggingUri == page.uri
       Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
           Modifier
             .size(96.dp)
-            .graphicsLayer { translationX = dragOffsetX }
-            .pointerInput(index) {
+            .graphicsLayer {
+              translationX = if (isDragging) dragOffsetX else 0f
+              scaleX = if (isDragging) 1.08f else 1f
+              scaleY = if (isDragging) 1.08f else 1f
+              shadowElevation = if (isDragging) 12f else 0f
+              shape = RoundedCornerShape(8.dp)
+              clip = true
+            }
+            .pointerInput(page.uri) {
               detectDragGesturesAfterLongPress(
+                onDragStart = {
+                  draggingUri = page.uri
+                  dragOffsetX = 0f
+                  try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
+                },
                 onDrag = { change, dragAmount ->
                   change.consume()
                   dragOffsetX += dragAmount.x
-                  if (dragOffsetX > dragThresholdPx && index < pages.lastIndex) {
-                    onMove(index, index + 1)
-                    dragOffsetX = 0f
-                  } else if (dragOffsetX < -dragThresholdPx && index > 0) {
-                    onMove(index, index - 1)
-                    dragOffsetX = 0f
+                  // Live reorder at half a card width, using the dragged
+                  // page's CURRENT index (not the stale captured one).
+                  val cur = latestPages.indexOfFirst { it.uri == page.uri }
+                  if (cur < 0) return@detectDragGesturesAfterLongPress
+                  val halfPx = cardFullPx / 2f
+                  if (dragOffsetX > halfPx && cur < latestPages.lastIndex) {
+                    latestOnMove(cur, cur + 1)
+                    dragOffsetX -= cardFullPx
+                  } else if (dragOffsetX < -halfPx && cur > 0) {
+                    latestOnMove(cur, cur - 1)
+                    dragOffsetX += cardFullPx
                   }
+                  // Auto-scroll at the strip edges while dragging.
+                  if (dragOffsetX > cardFullPx * 0.7f) scope.launch { listState.scrollBy(cardFullPx * 0.3f) }
+                  else if (dragOffsetX < -cardFullPx * 0.7f) scope.launch { listState.scrollBy(-cardFullPx * 0.3f) }
                 },
-                onDragEnd = { dragOffsetX = 0f },
-                onDragCancel = { dragOffsetX = 0f }
+                onDragEnd = {
+                  draggingUri = null
+                  dragOffsetX = 0f
+                  try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
+                },
+                onDragCancel = { draggingUri = null; dragOffsetX = 0f }
               )
             }
-            .clip(RoundedCornerShape(8.dp))
             .background(theme.card)
             .border(2.dp, if (isSel) theme.primary else theme.cardBorder, RoundedCornerShape(8.dp))
             .clickable { onSelect(index) }
@@ -848,7 +888,9 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   var cropBusy by remember { mutableStateOf(false) }
   var showFilters by remember { mutableStateOf(false) }
   var filterMode by remember { mutableStateOf(0) }
-  var filterOriginal by remember { mutableStateOf<Bitmap?>(null) }
+  // Original bitmap per page (keyed by page Uri): a single var lost the
+  // original whenever the user switched pages and came back (H9).
+  val filterOriginals = remember { mutableStateMapOf<Uri, Bitmap>() }
   var showAdjust by remember { mutableStateOf(false) }
   var brightness by remember { mutableStateOf(0f) }
   var pageSize by remember { mutableStateOf("A4") }
@@ -866,15 +908,18 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   ) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      if (SaveLocation.copyToUri(ctx, file, uri)) {
-        Toast.makeText(ctx, "Saved to chosen folder", Toast.LENGTH_SHORT).show()
-      } else {
-        Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          Toast.makeText(ctx, "Saved to chosen folder", Toast.LENGTH_SHORT).show()
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
       }
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
@@ -921,8 +966,13 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   fun applyFilterMode(mode: Int) {
     val page = pages.getOrNull(safeSelected) ?: return
-    if (filterOriginal == null) filterOriginal = page.bitmap
-    val base = filterOriginal ?: page.bitmap
+    // Do not move the chip until the edit is accepted: replacePage drops
+    // the edit silently while another edit is still running (H9).
+    if (cropBusy) {
+      Toast.makeText(ctx, "Please wait — finishing the last edit", Toast.LENGTH_SHORT).show()
+      return
+    }
+    val base = filterOriginals.getOrPut(page.uri) { page.bitmap }
     filterMode = mode
     if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
     else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
@@ -932,13 +982,13 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     if (pages.isEmpty()) return
     pages = pages.filterIndexed { i, _ -> i != safeSelected }
     selectedIndex = (safeSelected - 1).coerceAtLeast(0)
-    filterOriginal = null
+    filterOriginals.remove(pages.getOrNull(safeSelected)?.uri)
     filterMode = 0
   }
 
   // Filters never stack and Original restores the page: reset when the
   // selected page changes.
-  LaunchedEffect(safeSelected) { filterOriginal = null; filterMode = 0 }
+  LaunchedEffect(safeSelected) { filterMode = 0 }
 
   // Multi-select picker. APPENDS to the existing pages — never replaces.
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selected ->
@@ -983,9 +1033,9 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       CropEditorDialog(
         bitmap = page.bitmap,
         theme = theme,
-        onApply = { bmp -> filterOriginal = null; replacePage(index, bmp, closeCrop = true) },
+        onApply = { bmp -> filterOriginals.remove(page.uri); replacePage(index, bmp, closeCrop = true) },
         onDismiss = { if (!cropBusy) cropIndex = null },
-        onRotate = { filterOriginal = null; replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) }
+        onRotate = { filterOriginals.remove(page.uri); replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) }
       )
     }
   }
@@ -1071,8 +1121,16 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
           theme = theme,
           onSelect = { selectedIndex = it },
           onMove = { from, to ->
+            // Keep the big preview on the page being viewed: only follow
+            // the dragged page when it was the selected one (H12).
+            val wasSelected = selectedIndex
             pages = ImagePageEditor.move(pages, from, to)
-            selectedIndex = to
+            selectedIndex = when {
+              from == wasSelected -> to
+              from < wasSelected && to >= wasSelected -> wasSelected - 1
+              from > wasSelected && to <= wasSelected -> wasSelected + 1
+              else -> wasSelected
+            }
           },
           onAddPages = {
             vibrate()
@@ -1158,7 +1216,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   var selectedPage by remember { mutableStateOf(0) }
   var filterMode by remember { mutableStateOf(0) }
   var showFilters by remember { mutableStateOf(false) }
-  var scanOriginal by remember { mutableStateOf<Bitmap?>(null) }
+  val scanOriginals = remember { mutableStateMapOf<Uri, Bitmap>() }
   var autoQuad by remember { mutableStateOf<List<Offset>?>(null) }
   var isProcessing by remember { mutableStateOf(false) }
   var cropIndex by remember { mutableStateOf<Int?>(null) }
@@ -1179,15 +1237,18 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   ) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      if (SaveLocation.copyToUri(ctx, file, uri)) {
-        Toast.makeText(ctx, "Saved to chosen folder", Toast.LENGTH_SHORT).show()
-      } else {
-        Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          Toast.makeText(ctx, "Saved to chosen folder", Toast.LENGTH_SHORT).show()
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
       }
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
@@ -1258,8 +1319,11 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   fun applyFilterMode(mode: Int) {
     val page = pages.getOrNull(safeSelected) ?: return
-    if (scanOriginal == null) scanOriginal = page.bitmap
-    val base = scanOriginal ?: page.bitmap
+    if (editBusy) {
+      Toast.makeText(ctx, "Please wait — finishing the last edit", Toast.LENGTH_SHORT).show()
+      return
+    }
+    val base = scanOriginals.getOrPut(page.uri) { page.bitmap }
     filterMode = mode
     if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
     else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
@@ -1269,13 +1333,13 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     if (pages.isEmpty()) return
     pages = pages.filterIndexed { i, _ -> i != safeSelected }
     selectedPage = (safeSelected - 1).coerceAtLeast(0)
-    scanOriginal = null
+    scanOriginals.remove(pages.getOrNull(safeSelected)?.uri)
     filterMode = 0
   }
 
   // Filters never stack and Original restores the page: reset when the
   // selected page changes.
-  LaunchedEffect(safeSelected) { scanOriginal = null; filterMode = 0; showFilters = false }
+  LaunchedEffect(safeSelected) { filterMode = 0; showFilters = false }
 
   // Gallery: multi-select. Each selected image APPENDS a page.
   val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selected ->
@@ -1320,9 +1384,9 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       CropEditorDialog(
         bitmap = page.bitmap,
         theme = theme,
-        onApply = { bmp -> scanOriginal = null; replacePage(index, bmp, closeCrop = true) },
+        onApply = { bmp -> scanOriginals.remove(page.uri); replacePage(index, bmp, closeCrop = true) },
         onDismiss = { if (!editBusy) { cropIndex = null; autoQuad = null } },
-        onRotate = { scanOriginal = null; replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) },
+        onRotate = { scanOriginals.remove(page.uri); replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) },
         initialQuad = autoQuad
       )
     }
@@ -1490,8 +1554,14 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
           theme = theme,
           onSelect = { selectedPage = it },
           onMove = { from, to ->
+            val wasSelected = selectedPage
             pages = ImagePageEditor.move(pages, from, to)
-            selectedPage = to
+            selectedPage = when {
+              from == wasSelected -> to
+              from < wasSelected && to >= wasSelected -> wasSelected - 1
+              from > wasSelected && to <= wasSelected -> wasSelected + 1
+              else -> wasSelected
+            }
           },
           onAddPages = {
             vibrate()
@@ -1804,11 +1874,17 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
@@ -2045,6 +2121,7 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val scope = rememberCoroutineScope()
   var pdfUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
   var pdfPreviews by remember { mutableStateOf<List<Pair<Int, Bitmap?>>>(emptyList()) }
+  var previewJob by remember { mutableStateOf<Job?>(null) }
   var isProcessing by remember { mutableStateOf(false) }
 
   var pendingSaveFile by remember { mutableStateOf<File?>(null) }
@@ -2054,11 +2131,17 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
@@ -2077,13 +2160,19 @@ fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   }
 
   fun refreshPreviews(uris: List<Uri>) {
-    scope.launch(Dispatchers.IO) {
+    // Cancel any in-flight refresh and only apply the result if the
+    // file list has not changed since — otherwise a stale completion
+    // overwrites a reorder/remove (H10).
+    previewJob?.cancel()
+    previewJob = scope.launch(Dispatchers.IO) {
       val previews = uris.map { u ->
         val count = PdfEngine.pageCount(ctx, u)
         val bmp = PdfReader.renderPageBitmap(ctx, u, 0, 1.5f)
         Pair(count, bmp)
       }
-      withContext(Dispatchers.Main) { pdfPreviews = previews }
+      withContext(Dispatchers.Main) {
+        if (pdfUris == uris) pdfPreviews = previews
+      }
     }
   }
 
@@ -2285,23 +2374,35 @@ fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val pdfSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      doneMime = "application/pdf"
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          doneMime = "application/pdf"
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   val imgSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      doneMime = "image/jpeg"
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          doneMime = "image/jpeg"
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSavePdfFor) {
@@ -2681,23 +2782,35 @@ fun PassportPhotoScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val pdfSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      doneMime = "application/pdf"
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          doneMime = "application/pdf"
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   val imgSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      doneMime = "image/jpeg"
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          doneMime = "image/jpeg"
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSavePdfFor) {
@@ -2757,10 +2870,11 @@ fun PassportPhotoScreen(theme: ChamiTheme, onBack: () -> Unit) {
       if (ok) {
         if (is8UpSheet) {
           val sheetOut = PdfEngine.outFile(ctx, "Passport_Sheet8_${System.currentTimeMillis()}.pdf")
-          withContext(Dispatchers.IO) {
+          val sheetOk = withContext(Dispatchers.IO) {
             PdfEngine.passportPhotoSheet8(ctx, singleOut, sheetOut)
           }
-          launchSavePdfFor = sheetOut
+          if (sheetOk) launchSavePdfFor = sheetOut
+          else Toast.makeText(ctx, "Failed to create 8-up sheet", Toast.LENGTH_SHORT).show()
         } else {
           launchSaveImgFor = singleOut
         }
@@ -2907,11 +3021,17 @@ fun ResizeConvertScreen(theme: ChamiTheme, title: String = "Image Resizer", onBa
   val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/*")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
@@ -2971,8 +3091,8 @@ fun ResizeConvertScreen(theme: ChamiTheme, title: String = "Image Resizer", onBa
 
   fun convertSingle() {
     val u = imageUri ?: return
-    val w = widthStr.toIntOrNull() ?: 800
-    val h = heightStr.toIntOrNull() ?: 800
+    val w = (widthStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
+    val h = (heightStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
     val format = when (formatChoice) {
       "PNG" -> Bitmap.CompressFormat.PNG
       "WEBP" -> Bitmap.CompressFormat.WEBP
@@ -3012,8 +3132,8 @@ fun ResizeConvertScreen(theme: ChamiTheme, title: String = "Image Resizer", onBa
 
   fun convertBatch() {
     if (imageUris.isEmpty()) return
-    val w = widthStr.toIntOrNull() ?: 800
-    val h = heightStr.toIntOrNull() ?: 800
+    val w = (widthStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
+    val h = (heightStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
     val format = when (formatChoice) {
       "PNG" -> Bitmap.CompressFormat.PNG
       "WEBP" -> Bitmap.CompressFormat.WEBP
@@ -3267,23 +3387,35 @@ fun OcrScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val txtSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      doneMime = "text/plain"
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          doneMime = "text/plain"
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   val pdfSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      doneMime = "application/pdf"
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          doneMime = "application/pdf"
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveTxtFor) {
@@ -3558,7 +3690,14 @@ fun PdfReaderScreen(
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
     pdfUri = selected
     if (selected != null) {
-      totalPages = PdfEngine.pageCount(ctx, selected)
+      // New file: drop the previous PDF's cached pages, or the Reader
+      // would show PDF A's pages as PDF B's (H13). The page count is
+      // loaded on IO by LaunchedEffect(pdfUri) below — the old
+      // synchronous pageCount call blocked the main thread (H18).
+      pageBitmapCache.values.forEach { try { it.recycle() } catch (_: Exception) {} }
+      pageBitmapCache.clear()
+      currentBitmap = null
+      totalPages = 0
       currentPage = 0
       pageInput = "1"
       searchPages = emptyList()
@@ -3577,6 +3716,14 @@ fun PdfReaderScreen(
   // Reset display zoom/pan whenever the page changes.
   LaunchedEffect(currentPage) { zoom = 1f; pan = Offset.Zero }
 
+  // Free cached page bitmaps when leaving the Reader.
+  androidx.compose.runtime.DisposableEffect(Unit) {
+    onDispose {
+      pageBitmapCache.values.forEach { try { it.recycle() } catch (_: Exception) {} }
+      pageBitmapCache.clear()
+    }
+  }
+
   LaunchedEffect(pdfUri, currentPage, scale) {
     val u = pdfUri ?: return@LaunchedEffect
     pageBitmapCache[currentPage]?.let { cached ->
@@ -3588,7 +3735,16 @@ fun PdfReaderScreen(
     withContext(Dispatchers.IO) {
       val bmp = PdfReader.renderPageBitmap(ctx, u, currentPage, scale)
       withContext(Dispatchers.Main) {
-        if (bmp != null) pageBitmapCache[currentPage] = bmp
+        if (bmp != null) {
+          pageBitmapCache[currentPage] = bmp
+          // Keep only the current page and its neighbours; recycle the
+          // rest so a large PDF cannot exhaust memory (H14).
+          val keep = (currentPage - 1)..(currentPage + 1)
+          val evict = pageBitmapCache.keys.filter { it !in keep }
+          for (k in evict) {
+            pageBitmapCache.remove(k)?.let { try { it.recycle() } catch (_: Exception) {} }
+          }
+        }
         currentBitmap = bmp
         isLoadingPage = false
       }
@@ -3957,11 +4113,17 @@ fun PdfToTextScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
@@ -4150,11 +4312,17 @@ fun ProtectPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
     val file = pendingSaveFile
     if (uri != null && file != null) {
-      SaveLocation.copyToUri(ctx, file, uri)
-    }
-    if (file != null) {
-      doneFile = file
-      showDone = true
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) {
+          doneFile = file
+          showDone = true
+        } else {
+          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+        }
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
     }
   }
   LaunchedEffect(launchSaveFor) {
