@@ -2,6 +2,7 @@ package com.chami.pdfmaker.pdf
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
@@ -74,10 +75,12 @@ object PdfProtector {
    * Computes Standard PDF 1.4 encryption parameters (Algorithm 3.2 / 3.3 / 3.4).
    * Generates standard /Encrypt dictionary values compatible with Adobe Reader, Chrome, Google Drive.
    */
-  fun computeEncryptionParams(userPassword: String, ownerPassword: String = "", documentId: ByteArray): EncryptionParams {
+  fun computeEncryptionParams(userPassword: String, ownerPassword: String = "", documentId: ByteArray, pVal: Int = -4): EncryptionParams {
     val paddedUser = padPassword(userPassword)
     val paddedOwner = padPassword(ownerPassword.ifEmpty { userPassword })
-    val pVal = -4 // Permissions: no restrictions other than open password
+    // pVal: PDF permission flags. Default -4 = no restrictions other
+    // than the open password. Callers (setPermissions) clear the
+    // print bit (4) / copy bit (16) to restrict.
     val pBytes = byteArrayOf(
       (pVal and 0xFF).toByte(),
       ((pVal shr 8) and 0xFF).toByte(),
@@ -363,6 +366,130 @@ object PdfProtector {
     override fun write(b: ByteArray, off: Int, len: Int) {
       out.write(b, off, len)
       count += len
+    }
+  }
+
+  // Phase 6 — UNLOCK: remove the password from a PDF protected by
+  // this app (protectPdf / imagesToProtectedPdf, Standard V1/R2 RC4).
+  // Wrong password -> false. A PDF that was never encrypted is simply
+  // copied to out and returns true. PDFs encrypted by other tools
+  // (e.g. AES) cannot be unlocked by this code and return false.
+  // The output is rebuilt from the decrypted page images, so it is a
+  // plain, unencrypted PDF with the same pages.
+  fun unlockPdf(input: File, out: File, password: String): Boolean {
+    return try {
+      if (!input.exists()) return false
+      val bytes = input.readBytes()
+      val text = String(bytes, Charsets.ISO_8859_1)
+      if (!text.contains("/Encrypt")) {
+        input.copyTo(out, overwrite = true)
+        return true
+      }
+      if (!verifyPassword(input, password)) return false
+      val idHex = Regex("""/ID\s*\[\s*<([0-9a-fA-F]+)>""").find(text)
+        ?.groupValues?.get(1) ?: return false
+      val pVal = Regex("""/P\s*(-?[0-9]+)""").find(text)
+        ?.groupValues?.get(1)?.toIntOrNull() ?: -4
+      val docId = hexToBytes(idHex)
+      val enc = computeEncryptionParams(password, "", docId, pVal)
+      val encKey = enc.encryptionKey
+
+      // Find every Page object: its MediaBox size and its /Im1 image ref.
+      data class PageRef(val objNum: Int, val w: Int, val h: Int, val imgObj: Int)
+      val pageRefs = mutableListOf<PageRef>()
+      val objRegex = Regex("""(\d+) 0 obj\n(.*?)\nendobj""", RegexOption.DOT_MATCHES_ALL)
+      for (m in objRegex.findAll(text)) {
+        val body = m.groupValues[2]
+        if (!body.contains("/Type /Page ")) continue
+        val media = Regex("""/MediaBox\s*\[\s*0\s+0\s+([\d.]+)\s+([\d.]+)\s*\]""").find(body) ?: continue
+        val img = Regex("""/Im1\s+(\d+)\s+0\s*R""").find(body) ?: continue
+        pageRefs.add(
+          PageRef(
+            m.groupValues[1].toInt(),
+            media.groupValues[1].toFloat().toInt(),
+            media.groupValues[2].toFloat().toInt(),
+            img.groupValues[1].toInt()
+          )
+        )
+      }
+      if (pageRefs.isEmpty()) return false
+      pageRefs.sortBy { it.objNum }
+
+      val doc = android.graphics.pdf.PdfDocument()
+      var pageNo = 1
+      for (ref in pageRefs) {
+        // Image XObject stream: "N 0 obj ... stream\n<RC4 bytes>\nendstream"
+        val header = "${ref.imgObj} 0 obj"
+        val objStart = text.indexOf(header)
+        if (objStart < 0) { doc.close(); return false }
+        val streamStart = text.indexOf("stream\n", objStart)
+        if (streamStart < 0) { doc.close(); return false }
+        val dataStart = streamStart + "stream\n".length
+        val dataEnd = text.indexOf("\nendstream", dataStart)
+        if (dataEnd < 0) { doc.close(); return false }
+        val encJpg = bytes.copyOfRange(dataStart, dataEnd)
+        val key = objectKey(encKey, ref.imgObj)
+        val jpg = RC4(key).process(encJpg)
+        val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size) ?: run { doc.close(); return false }
+        val info = android.graphics.pdf.PdfDocument.PageInfo.Builder(ref.w, ref.h, pageNo++).create()
+        val page = doc.startPage(info)
+        page.canvas.drawColor(Color.WHITE)
+        page.canvas.drawBitmap(bmp, null, android.graphics.RectF(0f, 0f, ref.w.toFloat(), ref.h.toFloat()), null)
+        doc.finishPage(page)
+        bmp.recycle()
+      }
+      FileOutputStream(out).use { doc.writeTo(it) }
+      doc.close()
+      true
+    } catch (e: Exception) {
+      e.printStackTrace()
+      false
+    }
+  }
+
+  // Phase 6 — PERMISSIONS: (re-)protect a PLAIN pdf with a password
+  // and set print / copy permissions. allowPrint=false clears the
+  // print bit (4), allowCopy=false clears the copy/extract bit (16).
+  // Input must be an unencrypted PDF (PdfRenderer cannot open an
+  // encrypted one) — to change permissions on an already-protected
+  // file, unlock it first with unlockPdf(), then call this.
+  fun setPermissions(input: File, out: File, password: String, allowPrint: Boolean, allowCopy: Boolean): Boolean {
+    return try {
+      if (!input.exists()) return false
+      var pVal = -4
+      if (!allowPrint) pVal = pVal and 4.inv()
+      if (!allowCopy) pVal = pVal and 16.inv()
+      val pfd = android.os.ParcelFileDescriptor.open(input, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+      val renderer = PdfRenderer(pfd)
+      val pageCount = renderer.pageCount
+      if (pageCount == 0) { renderer.close(); pfd.close(); return false }
+      val pageBitmaps = mutableListOf<ByteArray>()
+      val pageDimensions = mutableListOf<Pair<Int, Int>>()
+      for (i in 0 until pageCount) {
+        val page = renderer.openPage(i)
+        val w = page.width
+        val h = page.height
+        val maxSide = maxOf(w, h)
+        val scale = if (maxSide > 1600) 1600f / maxSide else if (maxSide < 800) 1.5f else 1.0f
+        val bmp = Bitmap.createBitmap((w * scale).toInt(), (h * scale).toInt(), Bitmap.Config.ARGB_8888)
+        bmp.eraseColor(Color.WHITE)
+        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        page.close()
+        val baos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+        bmp.recycle()
+        pageBitmaps.add(baos.toByteArray())
+        pageDimensions.add(Pair(w, h))
+      }
+      renderer.close()
+      pfd.close()
+      val docId = md5(UUID.randomUUID().toString().toByteArray())
+      val enc = computeEncryptionParams(password, "", docId, pVal)
+      writeEncryptedPdf(pageBitmaps, pageDimensions, enc, docId, out)
+      true
+    } catch (e: Exception) {
+      e.printStackTrace()
+      false
     }
   }
 
