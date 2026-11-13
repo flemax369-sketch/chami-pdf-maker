@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">Início</string>
+    <string name="history">Histórico</string>
+    <string name="settings">Configurações</string>
+    <string name="simple_tools">FERRAMENTAS SIMPLES</string>
+    <string name="smart_tools">FERRAMENTAS INTELIGENTES</string>
+    <string name="images_to_pdf">Imagens para PDF</string>
+    <string name="scan_to_pdf">Digitalizar para PDF</string>
+    <string name="merge_pdf">Unir PDF</string>
+    <string name="split_pdf">Dividir PDF</string>
+    <string name="protect_pdf">Proteger PDF</string>
+    <string name="compress_kb">Compactar KB</string>
+    <string name="pdf_to_images">PDF para imagens</string>
+    <string name="image_resizer">Redimensionar imagem</string>
+    <string name="pdf_reader">Leitor de PDF</string>
+    <string name="format_convert">Converter formato</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">Converter</string>
+    <string name="save_pdf">Salvar PDF</string>
+    <string name="done">Concluído</string>
+    <string name="language">Idioma</string>
+    <string name="contact_support">Falar com o suporte</string>
+    <string name="check_updates">Verificar atualizações</string>
+    <string name="storage">Armazenamento</string>
+    <string name="app_lock">Bloqueio do app</string>
+    <string name="background">Fundo</string>
+    <string name="font_size">Tamanho da fonte</string>
+    <string name="clear_cache">Limpar cache</string>
+    <string name="privacy_policy">Política de privacidade</string>
+</resources>
