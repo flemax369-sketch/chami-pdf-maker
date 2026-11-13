@@ -8,8 +8,9 @@ import java.io.FileInputStream
 object SaveLocation {
   fun copyToUri(ctx: Context, file: File, uri: Uri): Boolean {
     return try {
-      ctx.contentResolver.openOutputStream(uri)?.use { out ->
-        FileInputStream(file).use { it.copyTo(out) }
+      val out = ctx.contentResolver.openOutputStream(uri) ?: return false
+      out.use { o ->
+        FileInputStream(file).use { it.copyTo(o) }
       }
       true
     } catch (_: Exception) { false }
