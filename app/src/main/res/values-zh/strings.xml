@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">首页</string>
+    <string name="history">历史记录</string>
+    <string name="settings">设置</string>
+    <string name="simple_tools">简单工具</string>
+    <string name="smart_tools">智能工具</string>
+    <string name="images_to_pdf">图片转 PDF</string>
+    <string name="scan_to_pdf">扫描转 PDF</string>
+    <string name="merge_pdf">合并 PDF</string>
+    <string name="split_pdf">拆分 PDF</string>
+    <string name="protect_pdf">保护 PDF</string>
+    <string name="compress_kb">压缩 KB</string>
+    <string name="pdf_to_images">PDF 转图片</string>
+    <string name="image_resizer">图片尺寸调整</string>
+    <string name="pdf_reader">PDF 阅读器</string>
+    <string name="format_convert">格式转换</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">转换</string>
+    <string name="save_pdf">保存 PDF</string>
+    <string name="done">完成</string>
+    <string name="language">语言</string>
+    <string name="contact_support">联系客服</string>
+    <string name="check_updates">检查更新</string>
+    <string name="storage">存储空间</string>
+    <string name="app_lock">应用锁</string>
+    <string name="background">背景</string>
+    <string name="font_size">字体大小</string>
+    <string name="clear_cache">清除缓存</string>
+    <string name="privacy_policy">隐私政策</string>
+</resources>
