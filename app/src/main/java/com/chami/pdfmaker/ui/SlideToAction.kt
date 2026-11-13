@@ -60,7 +60,11 @@ fun SlideToAction(
   val edgePaddingPx = with(density) { 4.dp.toPx() }
   var trackWidthPx by remember { mutableStateOf(0f) }
   val maxOffset = (trackWidthPx - thumbPx - edgePaddingPx * 2).coerceAtLeast(0f)
-  val offset = remember { Animatable(0f) }
+    val offset = remember { Animatable(0f) }
+  // Drag position tracked synchronously in plain state: Animatable.snapTo
+  // runs in a coroutine, so reading offset.value inside onDrag loses part
+  // of each delta on a fast swipe and the thumb can never reach 85%.
+  var dragOffset by remember { mutableStateOf(0f) }
   var halfTicked by remember { mutableStateOf(false) }
   var completed by remember { mutableStateOf(false) }
 
@@ -115,29 +119,34 @@ fun SlideToAction(
           detectDragGestures(
             onDragStart = {
               halfTicked = false
+              dragOffset = offset.value
               try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
             },
             onDragEnd = {
               scope.launch {
-                if (maxOffset > 0f && offset.value >= 0.85f * maxOffset) {
+                if (maxOffset > 0f && dragOffset >= 0.85f * maxOffset) {
                   if (!completed) {
                     completed = true
                     try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
                     onSlideComplete()
+                    // Reset at once so a second slide within the 300 ms
+                    // snap-back is not swallowed.
+                    completed = false
                   }
                 }
                 offset.animateTo(0f, tween(300))
-                completed = false
+                dragOffset = 0f
               }
             },
             onDragCancel = {
+              dragOffset = 0f
               scope.launch { offset.animateTo(0f, tween(300)) }
             },
             onDrag = { change, dragAmount ->
               change.consume()
-              val next = (offset.value + dragAmount.x).coerceIn(0f, maxOffset)
-              scope.launch { offset.snapTo(next) }
-              if (!halfTicked && maxOffset > 0f && next >= 0.5f * maxOffset) {
+              dragOffset = (dragOffset + dragAmount.x).coerceIn(0f, maxOffset)
+              scope.launch { offset.snapTo(dragOffset) }
+              if (!halfTicked && maxOffset > 0f && dragOffset >= 0.5f * maxOffset) {
                 halfTicked = true
                 try { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) } catch (_: Exception) {}
               }
