@@ -51,7 +51,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.chami.pdfmaker.ads.AdsManager
 import com.chami.pdfmaker.pdf.DocAlign
 import com.chami.pdfmaker.pdf.DocBlock
 import com.chami.pdfmaker.pdf.DocBlockType
@@ -572,7 +571,8 @@ fun WordTextEditorScreen(theme: ChamiTheme, onBack: () -> Unit) {
         }
         // Phase 1 ad hook: the PDF is built AFTER the ad closes (or
         // immediately if no ad is ready). The save is never blocked.
-        AdsManager.showBeforeSave(activity) {
+        // Phase 6: ads removed — build directly, no interstitial.
+        run {
           isProcessing = true
           scope.launch {
             val out = PdfEngine.outFile(ctx, "Doc_${System.currentTimeMillis()}.pdf")
