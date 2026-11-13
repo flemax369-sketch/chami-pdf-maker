@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">ホーム</string>
+    <string name="history">履歴</string>
+    <string name="settings">設定</string>
+    <string name="simple_tools">シンプルツール</string>
+    <string name="smart_tools">スマートツール</string>
+    <string name="images_to_pdf">画像をPDFに</string>
+    <string name="scan_to_pdf">スキャンをPDFに</string>
+    <string name="merge_pdf">PDFを結合</string>
+    <string name="split_pdf">PDFを分割</string>
+    <string name="protect_pdf">PDFを保護</string>
+    <string name="compress_kb">KBを圧縮</string>
+    <string name="pdf_to_images">PDFを画像に</string>
+    <string name="image_resizer">画像リサイズ</string>
+    <string name="pdf_reader">PDFリーダー</string>
+    <string name="format_convert">形式変換</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">変換</string>
+    <string name="save_pdf">PDFを保存</string>
+    <string name="done">完了</string>
+    <string name="language">言語</string>
+    <string name="contact_support">サポートに連絡</string>
+    <string name="check_updates">アップデートを確認</string>
+    <string name="storage">ストレージ</string>
+    <string name="app_lock">アプリロック</string>
+    <string name="background">背景</string>
+    <string name="font_size">フォントサイズ</string>
+    <string name="clear_cache">キャッシュを消去</string>
+    <string name="privacy_policy">プライバシーポリシー</string>
+</resources>
