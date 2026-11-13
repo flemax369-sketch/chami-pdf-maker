@@ -1,3 +1,31 @@
 <resources>
-    <string name="app_name">Chami - Img to PDF</string>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">Home</string>
+    <string name="history">History</string>
+    <string name="settings">Settings</string>
+    <string name="simple_tools">SIMPLE TOOLS</string>
+    <string name="smart_tools">SMART TOOLS</string>
+    <string name="images_to_pdf">Images to PDF</string>
+    <string name="scan_to_pdf">Scan to PDF</string>
+    <string name="merge_pdf">Merge PDF</string>
+    <string name="split_pdf">Split PDF</string>
+    <string name="protect_pdf">Protect PDF</string>
+    <string name="compress_kb">Compress KB</string>
+    <string name="pdf_to_images">PDF to Images</string>
+    <string name="image_resizer">Image Resizer</string>
+    <string name="pdf_reader">PDF Reader</string>
+    <string name="format_convert">Format Convert</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">Convert</string>
+    <string name="save_pdf">Save PDF</string>
+    <string name="done">Done</string>
+    <string name="language">Language</string>
+    <string name="contact_support">Contact Support</string>
+    <string name="check_updates">Check for Updates</string>
+    <string name="storage">Storage</string>
+    <string name="app_lock">App Lock</string>
+    <string name="background">Background</string>
+    <string name="font_size">Font Size</string>
+    <string name="clear_cache">Clear Cache</string>
+    <string name="privacy_policy">Privacy Policy</string>
 </resources>
