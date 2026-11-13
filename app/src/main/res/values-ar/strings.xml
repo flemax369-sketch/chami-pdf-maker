@@ -1,0 +1,31 @@
+<resources>
+    <string name="app_name">Chami PDF Maker</string>
+    <string name="home">الرئيسية</string>
+    <string name="history">السجل</string>
+    <string name="settings">الإعدادات</string>
+    <string name="simple_tools">أدوات بسيطة</string>
+    <string name="smart_tools">أدوات ذكية</string>
+    <string name="images_to_pdf">صور إلى PDF</string>
+    <string name="scan_to_pdf">مسح إلى PDF</string>
+    <string name="merge_pdf">دمج PDF</string>
+    <string name="split_pdf">تقسيم PDF</string>
+    <string name="protect_pdf">حماية PDF</string>
+    <string name="compress_kb">ضغط KB</string>
+    <string name="pdf_to_images">PDF إلى صور</string>
+    <string name="image_resizer">تغيير حجم الصورة</string>
+    <string name="pdf_reader">قارئ PDF</string>
+    <string name="format_convert">تحويل الصيغة</string>
+    <string name="ocr">OCR</string>
+    <string name="convert">تحويل</string>
+    <string name="save_pdf">حفظ PDF</string>
+    <string name="done">تم</string>
+    <string name="language">اللغة</string>
+    <string name="contact_support">الاتصال بالدعم</string>
+    <string name="check_updates">التحقق من التحديثات</string>
+    <string name="storage">التخزين</string>
+    <string name="app_lock">قفل التطبيق</string>
+    <string name="background">الخلفية</string>
+    <string name="font_size">حجم الخط</string>
+    <string name="clear_cache">مسح ذاكرة التخزين المؤقت</string>
+    <string name="privacy_policy">سياسة الخصوصية</string>
+</resources>
