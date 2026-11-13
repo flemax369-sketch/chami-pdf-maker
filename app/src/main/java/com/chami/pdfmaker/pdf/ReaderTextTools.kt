@@ -5,6 +5,8 @@ import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import java.io.*
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 // TOOL 14 - INBUILT PDF READER: render ONE page at a time, never load all pages.
 // In Compose: LazyColumn, for each page index call renderPageBitmap(ctx, uri, index, zoom)
@@ -78,4 +80,70 @@ fun textToPdf(ctx:Context, title:String, body:String, fontSize:Float=12f, outFil
     }
     FileOutputStream(outFile).use{ doc.writeTo(it) }; doc.close(); true
   } catch(e:Exception){ e.printStackTrace(); false }
+}
+
+// Phase 6 — SEARCH INSIDE A PDF (Reader).
+// NOTE: suspend, like pdfToText above — Android PdfRenderer has no
+// text extraction, so each page is rendered and read with the same
+// ML Kit OCR used by pdfToText. Returns 1-based page numbers whose
+// OCR text contains the query (case-insensitive). The caller owns the
+// PdfRenderer: it is NOT closed here. Slow on big PDFs — call from a
+// background coroutine and show progress.
+suspend fun searchInPdf(reader: PdfRenderer, query: String): List<Int> {
+  if (query.isBlank()) return emptyList()
+  val hits = mutableListOf<Int>()
+  for (i in 0 until reader.pageCount) {
+    try {
+      val page = reader.openPage(i)
+      val w = page.width
+      val h = page.height
+      val maxSide = maxOf(w, h)
+      val scale = if (maxSide > 1600) 1600f / maxSide else 1.5f
+      val bmp = Bitmap.createBitmap((w * scale).toInt(), (h * scale).toInt(), Bitmap.Config.ARGB_8888)
+      bmp.eraseColor(Color.WHITE)
+      page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+      page.close()
+      val text = ocrBitmap(bmp)
+      bmp.recycle()
+      if (text.contains(query, ignoreCase = true)) hits.add(i + 1)
+    } catch (e: Exception) {
+      e.printStackTrace()
+    }
+  }
+  return hits
+}
+
+// OCR for a Bitmap (same ML Kit client as ocrImage, which takes a Uri).
+private suspend fun ocrBitmap(bmp: Bitmap): String = suspendCancellableCoroutine { cont ->
+  try {
+    val image = com.google.mlkit.vision.common.InputImage.fromBitmap(bmp, 0)
+    com.google.mlkit.vision.text.TextRecognition
+      .getClient(com.google.mlkit.vision.text.latin.TextRecognizerOptions.DEFAULT_OPTIONS)
+      .process(image)
+      .addOnSuccessListener { cont.resume(it.text) }
+      .addOnFailureListener { cont.resume("") }
+  } catch (e: Exception) {
+    cont.resume("")
+  }
+}
+
+// Phase 6 — BOOKMARKS (Reader). Tiny SharedPreferences store:
+// one entry per file, a set of 1-based page numbers.
+private fun bookmarkKey(fileName: String): String =
+  "bm_" + fileName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+
+fun saveBookmark(context: Context, fileName: String, page: Int) {
+  val prefs = context.getSharedPreferences("chami_bookmarks", Context.MODE_PRIVATE)
+  val key = bookmarkKey(fileName)
+  val set = prefs.getStringSet(key, emptySet())?.toMutableSet() ?: mutableSetOf()
+  set.add(page.toString())
+  prefs.edit().putStringSet(key, set).apply()
+}
+
+fun getBookmarks(context: Context, fileName: String): List<Int> {
+  val prefs = context.getSharedPreferences("chami_bookmarks", Context.MODE_PRIVATE)
+  return prefs.getStringSet(bookmarkKey(fileName), emptySet())
+    ?.mapNotNull { it.toIntOrNull() }
+    ?.sorted()
+    ?: emptyList()
 }
