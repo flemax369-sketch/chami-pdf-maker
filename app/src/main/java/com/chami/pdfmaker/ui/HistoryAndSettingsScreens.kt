@@ -9,6 +9,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import com.chami.pdfmaker.BuildConfig
 import com.chami.pdfmaker.pdf.PdfEngine
 import com.chami.pdfmaker.pdf.PdfReader
