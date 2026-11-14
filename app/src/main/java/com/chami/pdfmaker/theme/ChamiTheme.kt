@@ -24,15 +24,15 @@ object ChamiThemes {
     id = "emerald_pro",
     name = "Executive Emerald",
     subtitle = "Clean light slate with forest emerald accents",
-    bg = Color(0xFFF8FAFC),
+    bg = Color(0xFFFFFFFF),
     card = Color(0xFFFFFFFF),
     cardBorder = Color(0xFFE2E8F0),
-    primary = Color(0xFF059669),
-    primaryDark = Color(0xFF047857),
-    text = Color(0xFF0F172A),
-    textSecondary = Color(0xFF64748B),
+    primary = Color(0xFF16A34A),
+    primaryDark = Color(0xFF14532D),
+    text = Color(0xFF1A2B1F),
+    textSecondary = Color(0xFF5B6B5F),
     textOnPrimary = Color.White,
-    accent = Color(0xFF10B981),
+    accent = Color(0xFF22C55E),
     isDark = false
   )
 
