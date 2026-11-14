@@ -15,15 +15,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chami.pdfmaker.R
 import com.chami.pdfmaker.theme.ChamiTheme
 
-// High-readability modern typography system
-val PixelFont = FontFamily.SansSerif
+// Real pixel font (Press Start 2P) from DesignSystem.kt — not SansSerif.
+val PixelFont = PixelFontFamily
 
 @Composable
 fun ChamiLogo(theme: ChamiTheme, fill: Float, modifier: Modifier = Modifier) {
@@ -155,7 +154,7 @@ fun ChamiLogo(theme: ChamiTheme, fill: Float, modifier: Modifier = Modifier) {
 fun ChamiAppIcon(theme: ChamiTheme) {
   Box(
     Modifier
-      .size(44.dp)
+      .size(40.dp)
       .clip(RoundedCornerShape(12.dp))
       .background(theme.card)
       .border(1.dp, theme.cardBorder, RoundedCornerShape(12.dp)),
