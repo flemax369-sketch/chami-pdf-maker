@@ -4,7 +4,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.TextRecognizerOptions
+import com.google.mlkit.vision.text.TextRecognizerOptionsInterface
 import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -27,7 +27,7 @@ fun isDevanagariLanguage(language: String): Boolean = when (language.trim().lowe
 // The recogniser options for a language name. "Hindi" (and Marathi /
 // Nepali) -> Devanagari recogniser; everything else -> Latin.
 // Unknown names fall back to Latin, never to a silent empty result.
-fun recognizerOptionsFor(language: String): TextRecognizerOptions =
+fun recognizerOptionsFor(language: String): TextRecognizerOptionsInterface =
   if (isDevanagariLanguage(language)) {
     DevanagariTextRecognizerOptions.Builder().build()
   } else {
