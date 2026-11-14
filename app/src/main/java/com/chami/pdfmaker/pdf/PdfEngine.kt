@@ -6,10 +6,17 @@ import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import java.io.*
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 object PdfEngine {
-  // Load bitmap safely - downsamples so 4GB phone never OOM. maxDim 2000 = sharp enough for A4.
-  fun loadBitmap(ctx:Context, uri:Uri, maxDim:Int=2000): Bitmap? {
+  // Load bitmap safely. maxDim is a LONG-SIDE cap only, to avoid OOM:
+  // default 4096px. Callers that load a small preview pass their own
+  // smaller cap explicitly (e.g. 1200 for a thumbnail); the PDF build
+  // path (buildImagesPdf) always loads at full resolution up to 4096px.
+  // There is NO 1600px cap on export any more (audit §1.1).
+  fun loadBitmap(ctx:Context, uri:Uri, maxDim:Int=4096): Bitmap? {
     return try {
       val opts = BitmapFactory.Options().apply{ inJustDecodeBounds=true }
       ctx.contentResolver.openInputStream(uri)?.use{ BitmapFactory.decodeStream(it, null, opts) }
@@ -68,6 +75,12 @@ object PdfEngine {
   }
 
   // SPLIT - keep only pages in keepSet (1-based). MERGE - pass multiple PDFs, all pages in order.
+  // HONEST LIMIT — RASTERISED OUTPUT: every source page is rendered to
+  // a bitmap and drawn into the new PDF, so selectable text, links and
+  // vector content are LOST; a text PDF comes out as pictures of text.
+  // android.graphics.pdf has no PDF object parser, so pages cannot be
+  // copied as objects with this codebase's libraries. Do not describe
+  // Merge / Split output as keeping text.
   fun copyPages(ctx:Context, sources:List<Pair<Uri,Set<Int>?>>, outFile:File): Boolean {
     return try {
       val doc = PdfDocument(); var pageNo=1
@@ -159,74 +172,175 @@ object PdfEngine {
     } catch(e:Exception) { false }
   }
 
-  // Phase 6 — IMAGES TO PDF WITH OPTIONS (page size / page numbers /
-  // watermark / quality). quality is a JPEG quality 10..95:
-  // High 95 / Medium 75 / Low 50. pageSize: "A4" (595x842),
-  // "Letter" (612x792) or "Original" (one page per image, sized to the
-  // image itself). Returns false if there is nothing to write.
-  fun imagesToPdfWithOptions(
+  // ------------------------------------------------------------------
+  // CANONICAL IMAGES-TO-PDF API (v1.2 engine fix, 2026-11-14).
+  // This is the ONE images-to-PDF implementation the ToolScreens batch
+  // must call. The old duplicate `imagesToPdfWithOptions` (PdfEngine)
+  // and the private `buildImagesPdfWithOptions` (ToolScreens) are
+  // deleted / must be deleted — they disagreed on quality, watermark
+  // and "Original" page size. Do not change this signature.
+  //
+  // Quality mapping, in this ONE place:
+  //   Original = 100 — source pixels are embedded unmodified: NO JPEG
+  //     round-trip is done on the working bitmap at all.
+  //   High = 95, Medium = 80, Low = 65 — one JPEG round-trip at that
+  //     quality, then the result is drawn. Unknown values fall back
+  //     to Medium (80).
+  // Page size:
+  //   "A4" = 595x842pt, "Letter" = 612x792pt, "Original" = the image's
+  //     TRUE size in points (width x height px at 72dpi) — NOT capped
+  //     to 595x842. Unknown values fall back to A4.
+  // Margins (marginsMm, all sides) apply only to A4 / Letter; they are
+  // ignored for "Original" (the page IS the image). 1mm = 72/25.4 pt.
+  // Watermark: size scales with the page (not a fixed 36/48pt), opacity
+  // comes from options (10-50%), position is centre-diagonal or
+  // bottom, and it is drawn on EVERY page. Blank text = no watermark.
+  // Bitmaps are loaded by the CALLER at full resolution (long side
+  // capped at 4096px only, to avoid OOM — see loadBitmap); this
+  // function never downsamples them. The caller keeps ownership of
+  // `pages`: they are NOT recycled here (only JPEG round-trip copies
+  // made inside this function are recycled).
+  // onProgress(done, total) is called after each page is finished, on
+  // the calling thread — call from a background thread and post to UI.
+  // Returns the written File (Chami folder, IMG_PDF_yyyyMMdd_HHmmss.pdf).
+  // Throws IllegalArgumentException if pages is empty.
+  // ------------------------------------------------------------------
+  data class ImagesPdfOptions(
+    val pageSize: String, /* A4|Letter|Original */
+    val quality: String, /* Original|High|Medium|Low */
+    val watermarkText: String,
+    val watermarkOpacity: Int, /* 10-50 */
+    val watermarkPosition: String, /* centre|bottom */
+    val pageNumbers: Boolean,
+    val marginsMm: Int
+  ) {
+    companion object {
+      /** Spec defaults: A4, Original quality, no watermark, no page numbers, 15mm margins. */
+      fun defaults() = ImagesPdfOptions(
+        pageSize = "A4", quality = "Original", watermarkText = "",
+        watermarkOpacity = 25, watermarkPosition = "centre",
+        pageNumbers = false, marginsMm = 15
+      )
+    }
+  }
+
+  /** The single quality mapping for the whole app (see ImagesPdfOptions). */
+  fun jpegQualityFor(quality: String): Int = when (quality.trim().lowercase(Locale.US)) {
+    "original" -> 100
+    "high" -> 95
+    "medium" -> 80
+    "low" -> 65
+    else -> 80 // unknown -> Medium
+  }
+
+  fun buildImagesPdf(
     ctx: Context,
-    uris: List<Uri>,
-    outFile: File,
-    pageSize: String,
-    pageNumbers: Boolean,
-    watermark: String?,
-    quality: Int
-  ): Boolean {
-    if (uris.isEmpty()) return false
-    val q = quality.coerceIn(10, 95)
-    return try {
-      val doc = PdfDocument()
-      var pageNo = 1
-      uris.forEach { uri ->
-        val raw = loadBitmap(ctx, uri) ?: return@forEach
-        // Apply the quality setting: JPEG round-trip at the chosen
-        // quality, then decode again for drawing.
-        val bmp = recompressAtQuality(raw, q)
-        if (bmp !== raw) raw.recycle()
-        val (pw, ph) = when (pageSize) {
-          "Letter" -> Pair(612, 792)
-          "Original" -> Pair(bmp.width.coerceAtLeast(1), bmp.height.coerceAtLeast(1))
-          else -> Pair(595, 842) // "A4" and any unknown value
-        }
-        val pageInfo = PdfDocument.PageInfo.Builder(pw, ph, pageNo).create()
-        val page = doc.startPage(pageInfo)
-        val c = page.canvas
-        c.drawColor(Color.WHITE)
-        if (pageSize == "Original") {
-          c.drawBitmap(bmp, null, RectF(0f, 0f, pw.toFloat(), ph.toFloat()), null)
+    pages: List<Bitmap>,
+    options: ImagesPdfOptions,
+    onProgress: (Int, Int) -> Unit
+  ): File {
+    require(pages.isNotEmpty()) { "buildImagesPdf: pages must not be empty" }
+    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    val outFile = outFile(ctx, "IMG_PDF_$stamp.pdf")
+    val doc = PdfDocument()
+    try {
+      val total = pages.size
+      pages.forEachIndexed { index, source ->
+        // "Original" quality: embed source pixels unmodified — no JPEG
+        // round-trip. Any other quality: one JPEG round-trip at the
+        // mapped quality, then draw the result.
+        val quality = jpegQualityFor(options.quality)
+        val bmp: Bitmap
+        var roundTripped: Bitmap? = null
+        if (quality >= 100) {
+          bmp = source
         } else {
-          val scale = minOf((pw - 72f) / bmp.width, (ph - 72f) / bmp.height)
-          val w = bmp.width * scale; val h = bmp.height * scale
-          val dst = RectF((pw - w) / 2, (ph - h) / 2, (pw + w) / 2, (ph + h) / 2)
-          c.drawBitmap(bmp, null, dst, null)
+          roundTripped = recompressAtQuality(source, quality)
+          bmp = roundTripped
         }
-        if (!watermark.isNullOrBlank()) {
-          val wmPaint = Paint().apply {
-            color = Color.argb(90, 0x64, 0x74, 0x8B)
-            textSize = 48f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            textAlign = Paint.Align.CENTER
+        try {
+          val (pw, ph) = when (options.pageSize.trim()) {
+            "Letter" -> Pair(612, 792)
+            // "Original": TRUE image size in points (px at 72dpi).
+            "Original" -> Pair(bmp.width.coerceAtLeast(1), bmp.height.coerceAtLeast(1))
+            else -> Pair(595, 842) // "A4" and any unknown value
           }
-          c.save()
-          c.rotate(-45f, pw / 2f, ph / 2f)
-          c.drawText(watermark, pw / 2f, ph / 2f, wmPaint)
-          c.restore()
-        }
-        if (pageNumbers) {
-          val numPaint = Paint().apply {
-            color = Color.rgb(0x64, 0x74, 0x8B); textSize = 12f
-            textAlign = Paint.Align.CENTER
+          val pageInfo = PdfDocument.PageInfo.Builder(pw, ph, index + 1).create()
+          val page = doc.startPage(pageInfo)
+          val c = page.canvas
+          c.drawColor(Color.WHITE)
+          if (options.pageSize.trim() == "Original") {
+            c.drawBitmap(bmp, null, RectF(0f, 0f, pw.toFloat(), ph.toFloat()), null)
+          } else {
+            val marginPt = (options.marginsMm.coerceAtLeast(0) * 72f / 25.4f)
+            val availW = (pw - 2 * marginPt).coerceAtLeast(1f)
+            val availH = (ph - 2 * marginPt).coerceAtLeast(1f)
+            val scale = minOf(availW / bmp.width, availH / bmp.height)
+            val w = bmp.width * scale; val h = bmp.height * scale
+            val dst = RectF((pw - w) / 2, (ph - h) / 2, (pw + w) / 2, (ph + h) / 2)
+            c.drawBitmap(bmp, null, dst, null)
           }
-          c.drawText("Page $pageNo", pw / 2f, ph - 18f, numPaint)
+          drawWatermark(c, options, pw, ph)
+          if (options.pageNumbers) {
+            // 12pt page number, bottom centre — a canvas point size,
+            // not a Compose sp value (documented one-off).
+            val numPaint = Paint().apply {
+              color = Color.rgb(0x14, 0x53, 0x2D) // deep green
+              textSize = 12f
+              textAlign = Paint.Align.CENTER
+            }
+            c.drawText("Page ${index + 1}", pw / 2f, ph - 18f, numPaint)
+          }
+          doc.finishPage(page)
+        } finally {
+          // Only recycle a real round-trip copy — never the caller's
+          // bitmap (recompressAtQuality returns the source unchanged
+          // when the round-trip fails, and the caller still owns it).
+          if (roundTripped != null && roundTripped !== source) roundTripped.recycle()
         }
-        doc.finishPage(page)
-        bmp.recycle()
-        pageNo++
+        onProgress(index + 1, total)
       }
-      if (pageNo == 1) { doc.close(); return false }
-      FileOutputStream(outFile).use { doc.writeTo(it) }; doc.close(); true
-    } catch (e: Exception) { e.printStackTrace(); false }
+      FileOutputStream(outFile).use { doc.writeTo(it) }
+      return outFile
+    } finally {
+      doc.close()
+    }
+  }
+
+  // Watermark drawn on one page. Size scales with the page (a fixed
+  // 36pt is tiny on A4 and huge on a small Original page); opacity is
+  // taken from options (10-50%); centre = diagonal across the middle,
+  // bottom = a smaller line near the foot of the page. Text is shrunk
+  // until it fits inside 85% of the page width.
+  private fun drawWatermark(canvas: Canvas, options: ImagesPdfOptions, pw: Int, ph: Int) {
+    val text = options.watermarkText.trim()
+    if (text.isEmpty()) return
+    val opacity = options.watermarkOpacity.coerceIn(10, 50)
+    val alpha = (opacity * 255 / 100).coerceIn(0, 255)
+    val base = minOf(pw, ph).toFloat()
+    val paint = Paint().apply {
+      color = Color.argb(alpha, 0x14, 0x53, 0x2D) // deep green, visible unlike faint grey
+      typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+      textAlign = Paint.Align.CENTER
+      isAntiAlias = true
+    }
+    if (options.watermarkPosition.trim().lowercase(Locale.US) == "bottom") {
+      paint.textSize = (base * 0.05f).coerceIn(12f, 48f)
+      while (paint.measureText(text) > pw * 0.85f && paint.textSize > 12f) {
+        paint.textSize -= 1f
+      }
+      // Above the page-number line (drawn at ph - 18) so they never collide.
+      canvas.drawText(text, pw / 2f, ph - 40f, paint)
+    } else { // "centre" (default) — diagonal across the middle
+      paint.textSize = (base * 0.09f).coerceIn(14f, 96f)
+      while (paint.measureText(text) > pw * 0.85f && paint.textSize > 14f) {
+        paint.textSize -= 1f
+      }
+      canvas.save()
+      canvas.rotate(-30f, pw / 2f, ph / 2f)
+      canvas.drawText(text, pw / 2f, ph / 2f, paint)
+      canvas.restore()
+    }
   }
 
   // JPEG round-trip at the given quality. Returns the original bitmap
@@ -234,7 +348,7 @@ object PdfEngine {
   private fun recompressAtQuality(bmp: Bitmap, quality: Int): Bitmap {
     return try {
       val baos = ByteArrayOutputStream()
-      bmp.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+      bmp.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 100), baos)
       val bytes = baos.toByteArray()
       BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: bmp
     } catch (e: Exception) { bmp }
@@ -246,11 +360,11 @@ object PdfEngine {
   // libraries in this project. This is a best-effort version: it
   // re-renders each page at the requested JPEG quality (same engine as
   // PdfCompress, full scale, exact quality) which shrinks image-heavy
-  // PDFs; text becomes rasterised, exactly like the existing
-  // PdfCompress.compressPdf. Returns false on failure.
+  // PDFs; text becomes rasterised — see PdfCompress.compressPdf, which
+  // says so plainly. Returns false on failure.
   fun compressPdfImages(ctx: Context, input: File, out: File, quality: Int): Boolean {
     if (!input.exists()) return false
-    val preset = PdfCompressPreset("Custom", 1.0f, quality.coerceIn(10, 95))
+    val preset = PdfCompress.presetForQuality(quality.coerceIn(10, 100))
     val result = PdfCompress.compressPdf(ctx, Uri.fromFile(input), preset, out)
     return result.ok
   }
