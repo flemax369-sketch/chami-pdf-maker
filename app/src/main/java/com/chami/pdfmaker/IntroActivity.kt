@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.chami.pdfmaker.theme.ThemeManager
 import com.chami.pdfmaker.ui.ChamiLogo
+import com.chami.pdfmaker.ui.Ds
 import kotlinx.coroutines.delay
 
 class IntroActivity : ComponentActivity() {
@@ -44,7 +45,7 @@ class IntroActivity : ComponentActivity() {
         Modifier
           .fillMaxSize()
           .background(theme.bg)
-          .padding(24.dp),
+          .padding(Ds.s16),
         contentAlignment = Alignment.Center
       ) {
         ChamiLogo(
