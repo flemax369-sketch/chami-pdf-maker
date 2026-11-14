@@ -4,13 +4,19 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import com.chami.pdfmaker.BuildConfig
 import com.chami.pdfmaker.pdf.PdfEngine
 import com.chami.pdfmaker.pdf.PdfReader
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
+import java.security.MessageDigest
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -20,12 +26,24 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -56,8 +74,9 @@ import java.util.Locale
 // (Chami_ = Images to PDF, Scan_ = Scan, Split_ = Split, Merged_ = Merge,
 // Compress_/Compressed_ = Compress, Resized_ = Resizer, protected_ = Protect).
 // There is no per-file tool record in v1.2, so files with an unknown prefix
-// only appear under "All". Before→after KB is NOT shown: no record of the
-// original size exists for a saved file, so only the current size is shown.
+// only appear under "All". Before→after KB is shown for compress results
+// recorded via recordCompressResult (SharedPreferences, keyed by output
+// file name); other files show only their current size.
 
 private sealed class HistoryEntry {
   data class Header(val title: String) : HistoryEntry()
@@ -98,24 +117,91 @@ private fun formatKb(bytes: Long): String {
   else "${bytes / 1024} KB"
 }
 
+private fun formatKbFromKb(kb: Long): String {
+  return if (kb >= 1024) "%.1f MB".format(kb / 1024f) else "$kb KB"
+}
+
+/** App Lock PIN hashing (SHA-256, never plain text). Stored as "sha256:<hex>". */
+fun hashPin(pin: String): String {
+  val digest = MessageDigest.getInstance("SHA-256").digest(pin.toByteArray(Charsets.UTF_8))
+  return "sha256:" + digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}
+
+/** Accepts a "sha256:…" hash, or a legacy plain 4-digit PIN (migrated on next unlock). */
+fun pinMatches(stored: String?, input: String): Boolean {
+  if (stored.isNullOrBlank() || input.length != 4) return false
+  return if (stored.startsWith("sha256:")) stored == hashPin(input) else stored == input
+}
+
+private const val COMPRESS_RESULTS_PREFS = "chami_compress_results"
+
+/**
+ * Record a compress result so History can show before→after KB.
+ * Call from the Compress screen when a compress finishes. Keyed by
+ * output file name; values are KB (before|after).
+ */
+fun recordCompressResult(ctx: Context, outputName: String, beforeKb: Long, afterKb: Long) {
+  ctx.getSharedPreferences(COMPRESS_RESULTS_PREFS, Context.MODE_PRIVATE)
+    .edit().putString(outputName, "$beforeKb|$afterKb").apply()
+}
+
+private fun readCompressResult(ctx: Context, outputName: String): Pair<Long, Long>? {
+  val raw = ctx.getSharedPreferences(COMPRESS_RESULTS_PREFS, Context.MODE_PRIVATE)
+    .getString(outputName, null) ?: return null
+  val parts = raw.split("|")
+  if (parts.size != 2) return null
+  val before = parts[0].toLongOrNull() ?: return null
+  val after = parts[1].toLongOrNull() ?: return null
+  return before to after
+}
+
+private fun dirSizeBytes(dir: File): Long {
+  if (!dir.exists()) return 0L
+  return try { dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } } catch (_: Exception) { 0L }
+}
+
+/** In-memory first-page thumbnail cache, keyed by file path (max ~40
+ *  entries, LRU). Rows render from the cache instantly instead of
+ *  popping in one by one with a placeholder. */
+private object HistoryThumbCache {
+  private const val MAX_ENTRIES = 40
+  private val map = object : LinkedHashMap<String, Bitmap>(MAX_ENTRIES, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>?): Boolean {
+      return size > MAX_ENTRIES
+    }
+  }
+
+  @Synchronized fun get(path: String): Bitmap? = map[path]
+  @Synchronized fun put(path: String, bmp: Bitmap) { map[path] = bmp }
+}
+
 @Composable
 private fun HistoryThumb(file: File, theme: ChamiTheme) {
   val ctx = LocalContext.current
-  var bmp by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
+  val isPdf = file.name.endsWith(".pdf", ignoreCase = true)
+  // Render from the in-memory cache first — no pop-in on revisit.
+  var bmp by remember(file.absolutePath) { mutableStateOf(HistoryThumbCache.get(file.absolutePath)) }
   LaunchedEffect(file.absolutePath) {
-    withContext(Dispatchers.IO) {
-      val uri = Uri.fromFile(file)
-      val b = if (file.name.endsWith(".pdf", ignoreCase = true)) {
-        PdfReader.renderPageBitmap(ctx, uri, 0, 0.35f)
-      } else {
-        PdfEngine.loadBitmap(ctx, uri, 200)
+    if (bmp == null) {
+      withContext(Dispatchers.IO) {
+        val uri = Uri.fromFile(file)
+        // Whole first page, fitted (never a cropped square): render at
+        // a modest scale and letterbox with ContentScale.Fit.
+        val b = if (isPdf) {
+          PdfReader.renderPageBitmap(ctx, uri, 0, 0.5f)
+        } else {
+          PdfEngine.loadBitmap(ctx, uri, 200)
+        }
+        if (b != null) {
+          HistoryThumbCache.put(file.absolutePath, b)
+          withContext(Dispatchers.Main) { bmp = b }
+        }
       }
-      withContext(Dispatchers.Main) { bmp = b }
     }
   }
   Box(
     Modifier
-      .size(72.dp)
+      .size(width = 48.dp, height = 64.dp)
       .clip(RoundedCornerShape(8.dp))
       .background(theme.bg)
       .border(1.dp, theme.cardBorder, RoundedCornerShape(8.dp)),
@@ -127,12 +213,15 @@ private fun HistoryThumb(file: File, theme: ChamiTheme) {
         bitmap = b.asImageBitmap(),
         contentDescription = "First page of ${file.name}",
         modifier = Modifier.fillMaxSize(),
-        contentScale = ContentScale.Crop
+        contentScale = ContentScale.Fit
       )
     } else {
-      Text(
-        if (file.name.endsWith(".pdf", ignoreCase = true)) "📄" else "🖼️",
-        fontSize = 20.sp
+      // Real vector icon while the thumbnail loads — never an emoji.
+      Icon(
+        if (isPdf) Icons.Filled.Description else Icons.Filled.Image,
+        contentDescription = null,
+        tint = theme.textSecondary,
+        modifier = Modifier.size(24.dp)
       )
     }
   }
@@ -140,7 +229,11 @@ private fun HistoryThumb(file: File, theme: ChamiTheme) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
+fun HistoryScreen(
+  theme: ChamiTheme,
+  onOpenInReader: ((File) -> Unit)? = null,
+  listState: LazyListState = rememberLazyListState(),
+) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
@@ -205,14 +298,16 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
 
   LaunchedEffect(Unit) { refresh() }
 
-  // Page counts are loaded off the main thread, one file at a time.
+  // Page counts are loaded off the main thread, in parallel, without
+  // blocking the list — rows show their metadata as counts arrive.
   LaunchedEffect(fileList) {
     withContext(Dispatchers.IO) {
-      val counts = mutableMapOf<String, Int>()
-      fileList.filter { it.name.endsWith(".pdf", ignoreCase = true) }.forEach { f ->
-        val n = PdfEngine.pageCount(ctx, Uri.fromFile(f))
-        if (n > 0) counts[f.absolutePath] = n
-      }
+      val counts = fileList
+        .filter { it.name.endsWith(".pdf", ignoreCase = true) }
+        .map { f -> async { f.absolutePath to PdfEngine.pageCount(ctx, Uri.fromFile(f)) } }
+        .awaitAll()
+        .filter { it.second > 0 }
+        .toMap()
       withContext(Dispatchers.Main) { pageCounts = counts }
     }
   }
@@ -273,36 +368,43 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
     }
   }
 
-  val filterChips = listOf(
-    "All", "Images to PDF", "Scan", "Merge", "Split", "Protect",
-    "Compress", "PDF to Images", "Resizer", "Reader", "OCR"
+  // Filter chips: All + one chip per tool that can actually produce a
+  // file (and has produced one here). PDF to Images / Reader / OCR
+  // write no files into the Chami folder, so those dead chips are gone.
+  val toolOrder = listOf(
+    "Images to PDF", "Scan", "Merge", "Split", "Protect", "Compress", "Resizer"
   )
+  val filterChips = remember(fileList) {
+    val present = fileList.map { historyToolOf(it) }.toSet()
+    listOf("All") + toolOrder.filter { it in present }
+  }
   val multiSelect = selected.isNotEmpty()
 
   Column(
     Modifier
       .fillMaxSize()
-      .padding(16.dp)
+      .padding(Ds.s16)
   ) {
-    // Title — smaller, consistent hierarchy (Phase 4, point 7).
+    // Title — Ds typography scale, multiplied by the Font Size setting.
     Text(
       text = LocaleHelper.t(ctx, "history"),
       fontFamily = PixelFont,
       fontWeight = FontWeight.ExtraBold,
-      fontSize = (20f * fontScale).sp,
+      fontSize = (Ds.TITLE_SP * fontScale).sp,
+      lineHeight = (Ds.TITLE_SP * 1.4 * fontScale).sp,
       color = theme.text
     )
     Text(
       text = "${fileList.size} documents saved",
-      fontFamily = PixelFont,
-      fontSize = (12f * fontScale).sp,
+      fontSize = (Ds.HINT_SP * fontScale).sp,
+      lineHeight = (Ds.HINT_SP * 1.4 * fontScale).sp,
       color = theme.textSecondary
     )
 
-    Spacer(Modifier.height(10.dp))
+    Spacer(Modifier.height(Ds.s12))
 
-    // Storage used (Phase 4, point 6) — real folder size, bar is the
-    // folder size against folder size + free space on that storage.
+    // Storage used — real folder size, bar is the folder size against
+    // folder size + free space on that storage.
     Row(
       Modifier.fillMaxWidth(),
       verticalAlignment = Alignment.CenterVertically,
@@ -310,8 +412,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
     ) {
       Text(
         "Storage used: ${formatKb(storageUsed)}",
-        fontFamily = PixelFont,
-        fontSize = (12f * fontScale).sp,
+        fontSize = (Ds.HINT_SP * fontScale).sp,
         color = theme.textSecondary
       )
     }
@@ -322,18 +423,21 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       trackColor = theme.cardBorder
     )
 
-    Spacer(Modifier.height(10.dp))
+    Spacer(Modifier.height(Ds.s12))
 
     // Search by file name.
     OutlinedTextField(
       value = query,
       onValueChange = { query = it },
       placeholder = {
-        Text("Search files…", fontFamily = PixelFont, fontSize = 12.sp, color = theme.textSecondary)
+        Text("Search files…", fontSize = (Ds.HINT_SP * fontScale).sp, color = theme.textSecondary)
+      },
+      leadingIcon = {
+        Icon(Icons.Filled.Search, contentDescription = "Search", tint = theme.textSecondary)
       },
       singleLine = true,
-      modifier = Modifier.fillMaxWidth().height(48.dp),
-      shape = RoundedCornerShape(10.dp),
+      modifier = Modifier.fillMaxWidth().height(Ds.minTouch),
+      shape = RoundedCornerShape(Ds.buttonRadius),
       colors = OutlinedTextFieldDefaults.colors(
         focusedBorderColor = theme.primary,
         unfocusedBorderColor = theme.cardBorder,
@@ -342,33 +446,20 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       )
     )
 
-    Spacer(Modifier.height(8.dp))
+    Spacer(Modifier.height(Ds.s8))
 
-    // Filter by tool (horizontal chip row).
-    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    // Filter by tool (horizontal chip row, 48dp targets).
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
       items(filterChips) { chip ->
-        val isSel = filter == chip
-        Box(
-          Modifier
-            .clip(RoundedCornerShape(16.dp))
-            .background(if (isSel) theme.primary else theme.card)
-            .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-            .clickable { vibrate(); filter = chip }
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-          contentAlignment = Alignment.Center
-        ) {
-          Text(
-            chip,
-            fontFamily = PixelFont,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            color = if (isSel) theme.textOnPrimary else theme.text
-          )
-        }
+        ChamiChip(
+          label = chip,
+          selected = filter == chip,
+          onClick = { vibrate(); filter = chip }
+        )
       }
     }
 
-    Spacer(Modifier.height(8.dp))
+    Spacer(Modifier.height(Ds.s8))
 
     // Sort + refresh row.
     Row(
@@ -379,12 +470,13 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       Box {
         OutlinedButton(
           onClick = { vibrate(); sortMenuOpen = true },
-          shape = RoundedCornerShape(10.dp),
+          shape = RoundedCornerShape(Ds.buttonRadius),
           border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
           colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.primary),
-          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+          modifier = Modifier.height(Ds.minTouch),
+          contentPadding = PaddingValues(horizontal = Ds.s12, vertical = Ds.s8)
         ) {
-          Text("SORT: $sortMode", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+          Text("SORT: $sortMode", fontFamily = PixelFont, fontSize = (Ds.HINT_SP * fontScale).sp, fontWeight = FontWeight.Bold)
         }
         DropdownMenu(
           expanded = sortMenuOpen,
@@ -402,12 +494,13 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       }
       OutlinedButton(
         onClick = { vibrate(); refresh() },
-        shape = RoundedCornerShape(10.dp),
+        shape = RoundedCornerShape(Ds.buttonRadius),
         border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.primary),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+        modifier = Modifier.height(Ds.minTouch),
+        contentPadding = PaddingValues(horizontal = Ds.s12, vertical = Ds.s8)
       ) {
-        Text("REFRESH", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text("REFRESH", fontFamily = PixelFont, fontSize = (Ds.HINT_SP * fontScale).sp, fontWeight = FontWeight.Bold)
       }
     }
 
@@ -489,14 +582,19 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
               .background(theme.primary.copy(alpha = 0.1f)),
             contentAlignment = Alignment.Center
           ) {
-            Text("📁", fontSize = 32.sp)
+            Icon(
+              Icons.Filled.Folder,
+              contentDescription = null,
+              tint = theme.primary,
+              modifier = Modifier.size(32.dp)
+            )
           }
           Spacer(Modifier.height(14.dp))
           Text(
             "No Documents Found",
             fontFamily = PixelFont,
             fontWeight = FontWeight.Bold,
-            fontSize = 15.sp,
+            fontSize = (Ds.BODY_SP * fontScale).sp,
             color = theme.text
           )
           Spacer(Modifier.height(6.dp))
@@ -512,8 +610,9 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
       }
     } else {
       LazyColumn(
+        state = listState,
         modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(Ds.s12)
       ) {
         items(entries, key = { entry ->
           when (entry) {
@@ -527,9 +626,10 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                 entry.title,
                 fontFamily = PixelFont,
                 fontWeight = FontWeight.Bold,
-                fontSize = (13f * fontScale).sp,
+                fontSize = (Ds.BODY_SP * fontScale).sp,
+                lineHeight = (Ds.BODY_SP * 1.4 * fontScale).sp,
                 color = theme.primary,
-                modifier = Modifier.padding(top = 4.dp)
+                modifier = Modifier.padding(top = Ds.s4)
               )
             }
             is HistoryEntry.FileRow -> {
@@ -539,9 +639,13 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
               val isSel = selected.contains(file.absolutePath)
               val isFav = favourites.contains(file.absolutePath)
               val pages = pageCounts[file.absolutePath]
+              val compressResult = if (historyToolOf(file) == "Compress") {
+                readCompressResult(ctx, file.name)
+              } else null
               Column(
                 Modifier
                   .fillMaxWidth()
+                  .defaultMinSize(minHeight = Ds.listRowMinHeight)
                   .clip(RoundedCornerShape(14.dp))
                   .background(if (isSel) theme.primary.copy(alpha = 0.12f) else theme.card)
                   .border(
@@ -568,7 +672,7 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                       else selected + file.absolutePath
                     }
                   )
-                  .padding(12.dp)
+                  .padding(Ds.s16)
               ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                   if (multiSelect) {
@@ -580,16 +684,17 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                       },
                       colors = CheckboxDefaults.colors(checkedColor = theme.primary)
                     )
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(Ds.s8))
                   }
                   HistoryThumb(file, theme)
-                  Spacer(Modifier.width(12.dp))
+                  Spacer(Modifier.width(Ds.s12))
                   Column(Modifier.weight(1f)) {
                     Text(
                       file.name,
                       fontFamily = PixelFont,
                       fontWeight = FontWeight.Bold,
-                      fontSize = (15f * fontScale).sp,
+                      fontSize = (Ds.BODY_SP * fontScale).sp,
+                      lineHeight = (Ds.BODY_SP * 1.4 * fontScale).sp,
                       color = theme.text,
                       maxLines = 1
                     )
@@ -600,24 +705,34 @@ fun HistoryScreen(theme: ChamiTheme, onOpenInReader: ((File) -> Unit)? = null) {
                         append(formatKb(file.length()))
                         append(" • ${sdf.format(Date(file.lastModified()))}")
                       },
-                      fontFamily = PixelFont,
-                      fontSize = (12f * fontScale).sp,
+                      fontSize = (Ds.META_SP * fontScale).sp,
+                      lineHeight = (Ds.META_SP * 1.4 * fontScale).sp,
                       color = theme.textSecondary
                     )
+                    if (compressResult != null) {
+                      Spacer(Modifier.height(3.dp))
+                      Text(
+                        "${formatKbFromKb(compressResult.first)} → ${formatKbFromKb(compressResult.second)}",
+                        fontSize = (Ds.META_SP * fontScale).sp,
+                        lineHeight = (Ds.META_SP * 1.4 * fontScale).sp,
+                        color = theme.primary
+                      )
+                    }
                   }
                   // Favourite / pin (star, persisted in SharedPreferences).
-                  IconButton(onClick = { vibrate(); toggleFavourite(file) }) {
-                    Text(
-                      if (isFav) "⭐" else "☆",
-                      fontSize = 18.sp,
-                      color = if (isFav) theme.primary else theme.textSecondary
-                    )
-                  }
+                  ChamiIconButton(
+                    icon = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                    description = if (isFav) "Remove favourite" else "Favourite",
+                    onClick = { vibrate(); toggleFavourite(file) },
+                    tint = if (isFav) theme.primary else theme.textSecondary
+                  )
                   // Row menu: rename / share / delete.
                   Box {
-                    IconButton(onClick = { menuFor = file.absolutePath }) {
-                      Text("⋮", fontSize = 18.sp, color = theme.text)
-                    }
+                    ChamiIconButton(
+                      icon = Icons.Filled.MoreVert,
+                      description = "More options",
+                      onClick = { menuFor = file.absolutePath }
+                    )
                     DropdownMenu(
                       expanded = menuFor == file.absolutePath,
                       onDismissRequest = { menuFor = null }
@@ -782,34 +897,65 @@ fun SettingsScreen(
 ) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
-  // Phase 5: no haptic toggle any more — haptic is always on
-  // (ThemeManager.hapticOn() now always returns true).
-  // Phase 6: THEME picker removed entirely — the theme is locked to
-  // Executive Emerald (emerald_pro) in MainActivity. onThemeChanged is
-  // kept only so the existing call site still compiles; it is never used.
+  // THEME picker removed entirely (Phase 6 lock): the theme is forced to
+  // Executive Emerald in MainActivity. onThemeChanged is kept only so the
+  // existing call site still compiles; it is never used.
   val prefs = remember { ctx.getSharedPreferences(LocaleHelper.PREFS, Context.MODE_PRIVATE) }
-  // Phase 6 Font Size: "font_scale" in chami_prefs (0.85 / 1.0 / 1.15).
   var fontScale by remember { mutableStateOf(prefs.getFloat("font_scale", 1.0f)) }
 
+  // Migrate a legacy plain-text PIN to its SHA-256 hash, once.
+  LaunchedEffect(Unit) {
+    val stored = prefs.getString("app_pin", null)
+    if (stored != null && !stored.startsWith("sha256:") && stored.length == 4 &&
+      stored.all { it.isDigit() }
+    ) {
+      prefs.edit().putString("app_pin", hashPin(stored)).apply()
+    }
+  }
+
   var showClearCacheDialog by remember { mutableStateOf(false) }
-  var showPrivacyPolicy by remember { mutableStateOf(false) }
+  var showPrivacyPolicyFallback by remember { mutableStateOf(false) }
   var showLanguageDialog by remember { mutableStateOf(false) }
   var showBackgroundDialog by remember { mutableStateOf(false) }
   var showFontSizeDialog by remember { mutableStateOf(false) }
   var showPinSetupDialog by remember { mutableStateOf(false) }
+  var showUpdateDialog by remember { mutableStateOf(false) }
+  var showAboutDialog by remember { mutableStateOf(false) }
+  var pinStep by remember { mutableStateOf(0) } // 0 = enter PIN, 1 = confirm it
+  var pinFirst by remember { mutableStateOf("") }
   var pinSetupText by remember { mutableStateOf("") }
-  var pinSetupError by remember { mutableStateOf(false) }
+  var pinSetupError by remember { mutableStateOf("") }
   var appLockOn by remember { mutableStateOf(prefs.getBoolean("app_lock", false)) }
   var bgKey by remember { mutableStateOf(prefs.getString("home_bg", "default") ?: "default") }
+  var bgOpacity by remember { mutableStateOf(prefs.getFloat("home_bg_opacity", 0.6f)) }
+  var previewFontScale by remember { mutableStateOf(fontScale) }
 
-  // Phase 6 Storage: real size of the app's Chami output folder.
-  val storageUsedBytes = remember {
-    val dir = File(ctx.getExternalFilesDir(null), "Chami")
-    if (dir.exists()) dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } else 0L
+  val chamiDir = remember { File(ctx.getExternalFilesDir(null), "Chami") }
+  var storageUsedBytes by remember { mutableStateOf(dirSizeBytes(chamiDir)) }
+  var cacheBytes by remember { mutableStateOf(dirSizeBytes(ctx.cacheDir)) }
+  fun refreshSizes() {
+    storageUsedBytes = dirSizeBytes(chamiDir)
+    cacheBytes = dirSizeBytes(ctx.cacheDir)
+  }
+
+  val bgPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    if (uri != null) {
+      try {
+        ctx.contentResolver.takePersistableUriPermission(
+          uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+        )
+      } catch (_: Exception) {}
+      prefs.edit()
+        .putString("home_bg", "custom")
+        .putString("home_bg_custom_uri", uri.toString())
+        .apply()
+      bgKey = "custom"
+      showBackgroundDialog = false
+      Toast.makeText(ctx, "Custom background set", Toast.LENGTH_SHORT).show()
+    }
   }
 
   fun vibrate() {
-    // Haptic is always on (no toggle) — always give the tap feedback.
     try {
       haptic.performHapticFeedback(HapticFeedbackType.LongPress)
     } catch (_: Exception) {}
@@ -817,25 +963,81 @@ fun SettingsScreen(
 
   fun openSupportEmail() {
     try {
-      val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:chami.support@gmail.com"))
+      val subject = Uri.encode("Chami PDF Maker ${BuildConfig.VERSION_NAME} — Support")
+      val intent = Intent(
+        Intent.ACTION_SENDTO,
+        Uri.parse("mailto:chami.support@gmail.com?subject=$subject")
+      )
       ctx.startActivity(intent)
     } catch (_: Exception) {
       Toast.makeText(ctx, "No email app found", Toast.LENGTH_SHORT).show()
     }
   }
 
+  fun openPrivacyPolicy() {
+    try {
+      val intent = Intent(
+        Intent.ACTION_VIEW,
+        Uri.parse("https://flemax369-sketch.github.io/chami-privacy/")
+      )
+      ctx.startActivity(intent)
+    } catch (_: Exception) {
+      // No browser available — fall back to the bundled copy.
+      showPrivacyPolicyFallback = true
+    }
+  }
+
+  fun checkForUpdates() {
+    try {
+      val intent = Intent(
+        Intent.ACTION_VIEW,
+        Uri.parse("market://details?id=${ctx.packageName}")
+      )
+      if (intent.resolveActivity(ctx.packageManager) != null) {
+        ctx.startActivity(intent)
+      } else {
+        showUpdateDialog = true
+      }
+    } catch (_: Exception) {
+      showUpdateDialog = true
+    }
+  }
+
+  // Honest labels: no pixel-art background assets exist in this build,
+  // so the picker offers colour tints (not the 5 pixel backgrounds)
+  // plus a custom gallery photo. This is stated in the dialog.
   val bgOptions = listOf(
     "default" to "Default White",
-    "grass" to "Pixel Grass",
-    "sky" to "Pixel Sky",
-    "night" to "Pixel Night",
-    "sunset" to "Pixel Sunset"
+    "grass" to "Grass tint",
+    "sky" to "Sky tint",
+    "night" to "Night tint",
+    "sunset" to "Sunset tint"
+  )
+  val bgTintColors = mapOf(
+    "default" to Color.White,
+    "grass" to Color(0xFFE8F5E9),
+    "sky" to Color(0xFFE3F2FD),
+    "night" to Color(0xFF111827),
+    "sunset" to Color(0xFFFFF3E0)
   )
   val fontOptions = listOf(
     "Small" to 0.85f,
-    "Medium" to 1.0f,
+    "Default" to 1.0f,
     "Large" to 1.15f
   )
+
+  @Composable
+  fun SectionHeading(text: String) {
+    Text(
+      text,
+      fontFamily = PixelFont,
+      fontWeight = FontWeight.Bold,
+      fontSize = (Ds.SECTION_SP * fontScale).sp,
+      lineHeight = (Ds.SECTION_SP * 1.4 * fontScale).sp,
+      color = theme.primaryDark,
+      modifier = Modifier.padding(top = Ds.s24, bottom = Ds.s12)
+    )
+  }
 
   @Composable
   fun SettingsRow(
@@ -849,15 +1051,16 @@ fun SettingsScreen(
     Row(
       Modifier
         .fillMaxWidth()
-        .clip(RoundedCornerShape(12.dp))
+        .defaultMinSize(minHeight = Ds.listRowMinHeight)
+        .clip(RoundedCornerShape(Ds.tileRadius))
         .clickable { vibrate(); onClick() }
-        .padding(horizontal = 12.dp, vertical = 14.dp),
+        .padding(horizontal = Ds.s16, vertical = Ds.s12),
       verticalAlignment = Alignment.CenterVertically
     ) {
       Text(
         title,
-        fontFamily = PixelFont,
-        fontSize = (14f * fontScale).sp,
+        fontSize = (Ds.BODY_SP * fontScale).sp,
+        lineHeight = (Ds.BODY_SP * 1.4 * fontScale).sp,
         fontWeight = FontWeight.SemiBold,
         color = theme.text,
         modifier = Modifier.weight(1f)
@@ -866,81 +1069,150 @@ fun SettingsScreen(
         Switch(
           checked = switchOn,
           onCheckedChange = { onSwitchChange?.invoke(it) },
-          colors = SwitchDefaults.colors(checkedThumbColor = theme.textOnPrimary, checkedTrackColor = theme.primary)
+          colors = SwitchDefaults.colors(
+            checkedThumbColor = theme.textOnPrimary,
+            checkedTrackColor = theme.primary
+          )
         )
       } else {
         if (value != null) {
           Text(
             value,
-            fontFamily = PixelFont,
-            fontSize = (12f * fontScale).sp,
+            fontSize = (Ds.HINT_SP * fontScale).sp,
+            lineHeight = (Ds.HINT_SP * 1.4 * fontScale).sp,
             color = theme.textSecondary
           )
-          Spacer(Modifier.width(8.dp))
+          Spacer(Modifier.width(Ds.s8))
         }
-        Text("›", fontSize = 18.sp, color = theme.textSecondary)
+        Icon(
+          Icons.Filled.ChevronRight,
+          contentDescription = null,
+          tint = theme.textSecondary,
+          modifier = Modifier.size(24.dp)
+        )
       }
     }
+  }
+
+  @Composable
+  fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
+    Column(
+      Modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(Ds.tileRadius))
+        .background(theme.card)
+        .border(1.dp, theme.cardBorder, RoundedCornerShape(Ds.tileRadius))
+        .padding(Ds.s4),
+      verticalArrangement = Arrangement.spacedBy(2.dp),
+      content = content
+    )
   }
 
   Column(
     Modifier
       .fillMaxSize()
-      .padding(16.dp)
+      .padding(Ds.s16)
       .verticalScroll(rememberScrollState())
   ) {
     Text(
       text = LocaleHelper.t(ctx, "settings"),
       fontFamily = PixelFont,
       fontWeight = FontWeight.ExtraBold,
-      fontSize = (16f * fontScale).sp,
+      fontSize = (Ds.TITLE_SP * fontScale).sp,
+      lineHeight = (Ds.TITLE_SP * 1.4 * fontScale).sp,
       color = theme.text
     )
 
-    Spacer(Modifier.height(18.dp))
+    Spacer(Modifier.height(Ds.s16))
 
-    // Phase 6 Settings rows — clean rows, title only, minimal subtext.
-    Column(
+    // Profile header: panda logo, CHAMI PRO, version. No share card —
+    // sharing lives on the Done screen and in History.
+    Row(
       Modifier
         .fillMaxWidth()
-        .clip(RoundedCornerShape(16.dp))
+        .clip(RoundedCornerShape(Ds.tileRadius))
         .background(theme.card)
-        .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-        .padding(4.dp),
-      verticalArrangement = Arrangement.spacedBy(2.dp)
+        .border(1.dp, theme.cardBorder, RoundedCornerShape(Ds.tileRadius))
+        .padding(Ds.s16),
+      verticalAlignment = Alignment.CenterVertically
     ) {
+      Image(
+        painter = painterResource(id = com.chami.pdfmaker.R.drawable.chami_logo_asset),
+        contentDescription = "Chami panda logo",
+        modifier = Modifier.size(40.dp),
+        contentScale = ContentScale.Fit
+      )
+      Spacer(Modifier.width(Ds.s12))
+      Column {
+        Text(
+          "CHAMI PRO",
+          fontFamily = PixelFont,
+          fontWeight = FontWeight.ExtraBold,
+          fontSize = (Ds.TITLE_SP * fontScale).sp,
+          lineHeight = (Ds.TITLE_SP * 1.4 * fontScale).sp,
+          color = theme.text
+        )
+        Text(
+          "Professional PDF Toolkit",
+          fontSize = (Ds.HINT_SP * fontScale).sp,
+          color = theme.textSecondary
+        )
+        Text(
+          "Version ${BuildConfig.VERSION_NAME}",
+          fontSize = (Ds.HINT_SP * fontScale).sp,
+          color = theme.textSecondary
+        )
+      }
+    }
+
+    // ---- General ----
+    SectionHeading("General")
+    SettingsCard {
       SettingsRow(
         title = LocaleHelper.t(ctx, "language"),
         value = LocaleHelper.LANGUAGES.firstOrNull { it.first == LocaleHelper.currentCode(ctx) }?.second,
         onClick = { showLanguageDialog = true }
       )
       SettingsRow(
-        title = LocaleHelper.t(ctx, "contact_support"),
-        value = "chami.support@gmail.com",
-        onClick = { openSupportEmail() }
+        title = LocaleHelper.t(ctx, "background"),
+        value = if (bgKey == "custom") "Custom photo" else bgOptions.firstOrNull { it.first == bgKey }?.second,
+        onClick = { showBackgroundDialog = true }
       )
       SettingsRow(
-        title = LocaleHelper.t(ctx, "check_updates"),
-        value = "1.2",
-        onClick = {
-          Toast.makeText(ctx, "You are on the latest version 1.2", Toast.LENGTH_SHORT).show()
-        }
+        title = LocaleHelper.t(ctx, "font_size"),
+        value = fontOptions.firstOrNull { it.second == fontScale }?.first,
+        onClick = { previewFontScale = fontScale; showFontSizeDialog = true }
       )
       SettingsRow(
         title = LocaleHelper.t(ctx, "storage"),
-        value = "Storage used: ${formatKb(storageUsedBytes)}",
-        onClick = {
-          Toast.makeText(ctx, "Storage used: ${formatKb(storageUsedBytes)}", Toast.LENGTH_SHORT).show()
-        }
+        value = "${formatKb(storageUsedBytes)} used • ${formatKb(cacheBytes)} cache",
+        onClick = { refreshSizes() }
       )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "clear_cache"),
+        value = formatKb(cacheBytes),
+        onClick = { refreshSizes(); showClearCacheDialog = true }
+      )
+      SettingsRow(
+        title = LocaleHelper.t(ctx, "check_updates"),
+        value = BuildConfig.VERSION_NAME,
+        onClick = { checkForUpdates() }
+      )
+    }
+
+    // ---- Security ----
+    SectionHeading("Security")
+    SettingsCard {
       SettingsRow(
         title = LocaleHelper.t(ctx, "app_lock"),
         showSwitch = true,
         switchOn = appLockOn,
         onSwitchChange = { wantOn ->
           if (wantOn) {
+            pinStep = 0
+            pinFirst = ""
             pinSetupText = ""
-            pinSetupError = false
+            pinSetupError = ""
             showPinSetupDialog = true
           } else {
             prefs.edit().putBoolean("app_lock", false).apply()
@@ -950,371 +1222,492 @@ fun SettingsScreen(
         },
         onClick = {
           if (!appLockOn) {
+            pinStep = 0
+            pinFirst = ""
             pinSetupText = ""
-            pinSetupError = false
+            pinSetupError = ""
             showPinSetupDialog = true
           }
         }
       )
+    }
+
+    // ---- About ----
+    SectionHeading("About")
+    SettingsCard {
       SettingsRow(
-        title = LocaleHelper.t(ctx, "background"),
-        value = bgOptions.firstOrNull { it.first == bgKey }?.second,
-        onClick = { showBackgroundDialog = true }
+        title = LocaleHelper.t(ctx, "contact_support"),
+        value = "chami.support@gmail.com",
+        onClick = { openSupportEmail() }
       )
       SettingsRow(
-        title = LocaleHelper.t(ctx, "font_size"),
-        value = fontOptions.firstOrNull { it.second == fontScale }?.first,
-        onClick = { showFontSizeDialog = true }
+        title = LocaleHelper.t(ctx, "privacy_policy"),
+        onClick = { openPrivacyPolicy() }
+      )
+      SettingsRow(
+        title = "About",
+        value = "Version ${BuildConfig.VERSION_NAME}",
+        onClick = { showAboutDialog = true }
       )
     }
 
-    Spacer(Modifier.height(20.dp))
+    Spacer(Modifier.height(Ds.s24))
+  }
 
-    // STORAGE & PRIVACY buttons (kept from before).
-    Row(
-      Modifier.fillMaxWidth(),
-      horizontalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-      OutlinedButton(
-        onClick = {
-          vibrate()
-          showClearCacheDialog = true
-        },
-        modifier = Modifier.weight(1f).height(46.dp),
-        shape = RoundedCornerShape(10.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-      ) {
-        Text(
-          LocaleHelper.t(ctx, "clear_cache").uppercase(),
-          fontFamily = PixelFont,
-          color = theme.text,
-          fontSize = (11f * fontScale).sp,
-          fontWeight = FontWeight.Bold
-        )
-      }
-
-      OutlinedButton(
-        onClick = {
-          vibrate()
-          showPrivacyPolicy = true
-        },
-        modifier = Modifier.weight(1f).height(46.dp),
-        shape = RoundedCornerShape(10.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-      ) {
-        Text(
-          LocaleHelper.t(ctx, "privacy_policy").uppercase(),
-          fontFamily = PixelFont,
-          color = theme.text,
-          fontSize = (11f * fontScale).sp,
-          fontWeight = FontWeight.Bold
-        )
-      }
-    }
-
-    Spacer(Modifier.height(24.dp))
-
-    // Clean version card (Phase 5): just the version and the tagline —
-    // exactly "Easy. Faster. Safe.", nothing else.
-    Column(
-      Modifier
-        .fillMaxWidth()
-        .clip(RoundedCornerShape(16.dp))
-        .background(theme.card)
-        .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-        .padding(16.dp),
-      horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-      Text(
-        "Version 1.2",
-        fontFamily = PixelFont,
-        fontWeight = FontWeight.Bold,
-        fontSize = (14f * fontScale).sp,
-        color = theme.text
-      )
-      Spacer(Modifier.height(3.dp))
-      Text(
-        "Easy. Faster. Safe.",
-        fontFamily = PixelFont,
-        fontSize = (12f * fontScale).sp,
-        color = theme.textSecondary
-      )
-    }
-
-    Spacer(Modifier.height(24.dp))
-
-    // Dialog: Language — tapping a language switches immediately.
-    if (showLanguageDialog) {
-      AlertDialog(
-        onDismissRequest = { showLanguageDialog = false },
-        confirmButton = {},
-        dismissButton = {
-          TextButton(onClick = { showLanguageDialog = false }) {
-            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-          }
-        },
-        title = {
-          Text(LocaleHelper.t(ctx, "language"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        },
-        text = {
-          Column {
-            LocaleHelper.LANGUAGES.forEach { (code, name) ->
-              val isCurrent = code == LocaleHelper.currentCode(ctx)
-              Row(
-                Modifier
-                  .fillMaxWidth()
-                  .clip(RoundedCornerShape(8.dp))
-                  .clickable {
-                    vibrate()
-                    showLanguageDialog = false
-                    LocaleHelper.setLocale(ctx, code)
-                  }
-                  .padding(vertical = 10.dp, horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-              ) {
-                Text(
-                  name,
-                  fontFamily = PixelFont,
-                  fontSize = 14.sp,
-                  fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
-                  color = if (isCurrent) theme.primary else theme.text,
-                  modifier = Modifier.weight(1f)
-                )
-                if (isCurrent) Text("✓", fontSize = 14.sp, color = theme.primary, fontWeight = FontWeight.Bold)
-              }
-            }
-          }
+  // Dialog: Language — tapping a language switches immediately.
+  if (showLanguageDialog) {
+    AlertDialog(
+      onDismissRequest = { showLanguageDialog = false },
+      confirmButton = {},
+      dismissButton = {
+        TextButton(onClick = { showLanguageDialog = false }) {
+          Text("CANCEL", fontFamily = PixelFont, color = theme.text)
         }
-      )
-    }
-
-    // Dialog: Background — stored in chami_prefs "home_bg", used as a
-    // tint/colour on the Home screen in MainActivity.
-    if (showBackgroundDialog) {
-      AlertDialog(
-        onDismissRequest = { showBackgroundDialog = false },
-        confirmButton = {},
-        dismissButton = {
-          TextButton(onClick = { showBackgroundDialog = false }) {
-            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-          }
-        },
-        title = {
-          Text(LocaleHelper.t(ctx, "background"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        },
-        text = {
-          Column {
-            bgOptions.forEach { (key, name) ->
-              val isCurrent = key == bgKey
-              Row(
-                Modifier
-                  .fillMaxWidth()
-                  .clip(RoundedCornerShape(8.dp))
-                  .clickable {
-                    vibrate()
-                    prefs.edit().putString("home_bg", key).apply()
-                    bgKey = key
-                    showBackgroundDialog = false
-                    Toast.makeText(ctx, "Background set: $name", Toast.LENGTH_SHORT).show()
-                  }
-                  .padding(vertical = 10.dp, horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-              ) {
-                Text(
-                  name,
-                  fontFamily = PixelFont,
-                  fontSize = 14.sp,
-                  fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
-                  color = if (isCurrent) theme.primary else theme.text,
-                  modifier = Modifier.weight(1f)
-                )
-                if (isCurrent) Text("✓", fontSize = 14.sp, color = theme.primary, fontWeight = FontWeight.Bold)
-              }
-            }
-          }
-        }
-      )
-    }
-
-    // Dialog: Font Size — stored in chami_prefs "font_scale".
-    if (showFontSizeDialog) {
-      AlertDialog(
-        onDismissRequest = { showFontSizeDialog = false },
-        confirmButton = {},
-        dismissButton = {
-          TextButton(onClick = { showFontSizeDialog = false }) {
-            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-          }
-        },
-        title = {
-          Text(LocaleHelper.t(ctx, "font_size"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        },
-        text = {
-          Column {
-            fontOptions.forEach { (name, scale) ->
-              val isCurrent = scale == fontScale
-              Row(
-                Modifier
-                  .fillMaxWidth()
-                  .clip(RoundedCornerShape(8.dp))
-                  .clickable {
-                    vibrate()
-                    prefs.edit().putFloat("font_scale", scale).apply()
-                    fontScale = scale
-                    showFontSizeDialog = false
-                  }
-                  .padding(vertical = 10.dp, horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-              ) {
-                Text(
-                  name,
-                  fontFamily = PixelFont,
-                  fontSize = 14.sp,
-                  fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
-                  color = if (isCurrent) theme.primary else theme.text,
-                  modifier = Modifier.weight(1f)
-                )
-                if (isCurrent) Text("✓", fontSize = 14.sp, color = theme.primary, fontWeight = FontWeight.Bold)
-              }
-            }
-          }
-        }
-      )
-    }
-
-    // Dialog: App Lock — set a real 4-digit PIN, stored in chami_prefs
-    // "app_pin"; "app_lock" is turned on only once a PIN is saved.
-    // MainActivity shows the PIN entry overlay on start while it is on.
-    if (showPinSetupDialog) {
-      AlertDialog(
-        onDismissRequest = { showPinSetupDialog = false },
-        confirmButton = {
-          Button(
-            onClick = {
-              val pin = pinSetupText.filter { it.isDigit() }
-              if (pin.length == 4) {
-                prefs.edit().putString("app_pin", pin).putBoolean("app_lock", true).apply()
-                appLockOn = true
-                showPinSetupDialog = false
-                Toast.makeText(ctx, "App Lock ON", Toast.LENGTH_SHORT).show()
-              } else {
-                pinSetupError = true
-              }
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
-          ) {
-            Text("SAVE PIN", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
-        },
-        dismissButton = {
-          TextButton(onClick = { showPinSetupDialog = false }) {
-            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-          }
-        },
-        title = {
-          Text("Set a 4-digit PIN", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-        },
-        text = {
-          Column {
-            OutlinedTextField(
-              value = pinSetupText,
-              onValueChange = {
-                pinSetupText = it.filter { c -> c.isDigit() }.take(4)
-                pinSetupError = false
-              },
-              singleLine = true,
-              visualTransformation = PasswordVisualTransformation(),
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-              isError = pinSetupError,
-              placeholder = { Text("••••", fontFamily = PixelFont, fontSize = 14.sp) },
-              modifier = Modifier.fillMaxWidth()
-            )
-            if (pinSetupError) {
-              Spacer(Modifier.height(6.dp))
+      },
+      title = {
+        Text(LocaleHelper.t(ctx, "language"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+      },
+      text = {
+        Column {
+          LocaleHelper.LANGUAGES.forEach { (code, name) ->
+            val isCurrent = code == LocaleHelper.currentCode(ctx)
+            Row(
+              Modifier
+                .fillMaxWidth()
+                .defaultMinSize(minHeight = Ds.minTouch)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable {
+                  vibrate()
+                  showLanguageDialog = false
+                  LocaleHelper.setLocale(ctx, code)
+                }
+                .padding(vertical = Ds.s8, horizontal = Ds.s4),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
               Text(
-                "Enter exactly 4 digits",
+                name,
+                fontSize = (Ds.BODY_SP * fontScale).sp,
+                fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
+                color = if (isCurrent) theme.primary else theme.text,
+                modifier = Modifier.weight(1f)
+              )
+              if (isCurrent) {
+                Icon(Icons.Filled.Check, contentDescription = "Current language", tint = theme.primary)
+              }
+            }
+          }
+        }
+      }
+    )
+  }
+
+  // Dialog: Background — colour tints (no pixel assets in this build)
+  // + custom photo, opacity slider 20–100% (default 60%), live Home
+  // preview. Applies to Home only.
+  if (showBackgroundDialog) {
+    AlertDialog(
+      onDismissRequest = { showBackgroundDialog = false },
+      confirmButton = {
+        TextButton(onClick = { showBackgroundDialog = false }) {
+          Text("DONE", fontFamily = PixelFont, color = theme.primary)
+        }
+      },
+      title = {
+        Text(LocaleHelper.t(ctx, "background"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+      },
+      text = {
+        Column {
+          Text(
+            "Pixel backgrounds are not included in this build — these are colour tints. " +
+              "A custom photo can be picked from your gallery.",
+            fontSize = (Ds.HINT_SP * fontScale).sp,
+            lineHeight = (Ds.HINT_SP * 1.4 * fontScale).sp,
+            color = theme.textSecondary
+          )
+          Spacer(Modifier.height(Ds.s12))
+          // Live Home preview: tint/photo colour at the chosen opacity.
+          Box(
+            Modifier
+              .fillMaxWidth()
+              .height(96.dp)
+              .clip(RoundedCornerShape(Ds.tileRadius))
+              .background(Color.White)
+              .border(1.dp, theme.cardBorder, RoundedCornerShape(Ds.tileRadius)),
+            contentAlignment = Alignment.Center
+          ) {
+            Box(
+              Modifier
+                .fillMaxSize()
+                .background(
+                  (bgTintColors[bgKey] ?: Color.White).copy(alpha = bgOpacity)
+                )
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+              Image(
+                painter = painterResource(id = com.chami.pdfmaker.R.drawable.chami_logo_asset),
+                contentDescription = null,
+                modifier = Modifier.size(40.dp),
+                contentScale = ContentScale.Fit
+              )
+              Spacer(Modifier.width(Ds.s8))
+              Text(
+                "CHAMI PRO",
                 fontFamily = PixelFont,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.error
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = (Ds.SECTION_SP * fontScale).sp,
+                color = theme.text
               )
             }
           }
-        }
-      )
-    }
-
-    // Dialog: Clear Cache
-    if (showClearCacheDialog) {
-      AlertDialog(
-        onDismissRequest = { showClearCacheDialog = false },
-        confirmButton = {
-          Button(
-            onClick = {
-              vibrate()
-              try {
-                ctx.cacheDir.deleteRecursively()
-                val chamiTmp = File(ctx.getExternalFilesDir(null), "Chami/tmppdf")
-                if (chamiTmp.exists()) chamiTmp.deleteRecursively()
-                Toast.makeText(ctx, "Cache cleared successfully ✓", Toast.LENGTH_SHORT).show()
-              } catch (e: Exception) {
-                e.printStackTrace()
-              }
-              showClearCacheDialog = false
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
-          ) {
-            Text("CLEAR", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
-        },
-        dismissButton = {
-          TextButton(onClick = { showClearCacheDialog = false }) {
-            Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-          }
-        },
-        title = {
-          Text("Clear Temporary Cache?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-        },
-        text = {
+          Spacer(Modifier.height(Ds.s12))
           Text(
-            "This will clean temporary image buffers. Your saved documents will not be affected.",
+            "Opacity: ${(bgOpacity * 100).toInt()}%",
+            fontSize = (Ds.BODY_SP * fontScale).sp,
+            fontWeight = FontWeight.SemiBold,
+            color = theme.text
+          )
+          Slider(
+            value = bgOpacity,
+            onValueChange = {
+              bgOpacity = it
+              prefs.edit().putFloat("home_bg_opacity", it).apply()
+            },
+            valueRange = 0.2f..1.0f,
+            colors = SliderDefaults.colors(
+              thumbColor = theme.primary,
+              activeTrackColor = theme.primary
+            )
+          )
+          Spacer(Modifier.height(Ds.s8))
+          bgOptions.forEach { (key, name) ->
+            val isCurrent = key == bgKey
+            Row(
+              Modifier
+                .fillMaxWidth()
+                .defaultMinSize(minHeight = Ds.minTouch)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable {
+                  vibrate()
+                  prefs.edit().putString("home_bg", key).apply()
+                  bgKey = key
+                }
+                .padding(vertical = Ds.s8, horizontal = Ds.s4),
+              verticalAlignment = Alignment.CenterVertically
+            ) {
+              Box(
+                Modifier
+                  .size(24.dp)
+                  .clip(RoundedCornerShape(6.dp))
+                  .background(bgTintColors[key] ?: Color.White)
+                  .border(1.dp, theme.cardBorder, RoundedCornerShape(6.dp))
+              )
+              Spacer(Modifier.width(Ds.s12))
+              Text(
+                name,
+                fontSize = (Ds.BODY_SP * fontScale).sp,
+                fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.SemiBold,
+                color = if (isCurrent) theme.primary else theme.text,
+                modifier = Modifier.weight(1f)
+              )
+              if (isCurrent) {
+                Icon(Icons.Filled.Check, contentDescription = "Current background", tint = theme.primary)
+              }
+            }
+          }
+          Row(
+            Modifier
+              .fillMaxWidth()
+              .defaultMinSize(minHeight = Ds.minTouch)
+              .clip(RoundedCornerShape(8.dp))
+              .clickable { bgPicker.launch("image/*") }
+              .padding(vertical = Ds.s8, horizontal = Ds.s4),
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Text(
+              "Custom photo…",
+              fontSize = (Ds.BODY_SP * fontScale).sp,
+              fontWeight = if (bgKey == "custom") FontWeight.ExtraBold else FontWeight.SemiBold,
+              color = if (bgKey == "custom") theme.primary else theme.text,
+              modifier = Modifier.weight(1f)
+            )
+            if (bgKey == "custom") {
+              Icon(Icons.Filled.Check, contentDescription = "Current background", tint = theme.primary)
+            }
+          }
+        }
+      }
+    )
+  }
+
+  // Dialog: Font Size — segmented Small / Default / Large, with a
+  // preview sentence rendered at the chosen size before leaving.
+  if (showFontSizeDialog) {
+    AlertDialog(
+      onDismissRequest = { showFontSizeDialog = false },
+      confirmButton = {
+        TextButton(onClick = { showFontSizeDialog = false }) {
+          Text("DONE", fontFamily = PixelFont, color = theme.primary)
+        }
+      },
+      title = {
+        Text(LocaleHelper.t(ctx, "font_size"), fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+      },
+      text = {
+        Column {
+          Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(Ds.s8)
+          ) {
+            fontOptions.forEach { (name, scale) ->
+              ChamiChip(
+                label = name,
+                selected = previewFontScale == scale,
+                onClick = {
+                  vibrate()
+                  previewFontScale = scale
+                  fontScale = scale
+                  prefs.edit().putFloat("font_scale", scale).apply()
+                },
+                modifier = Modifier.weight(1f)
+              )
+            }
+          }
+          Spacer(Modifier.height(Ds.s16))
+          Text(
+            "The quick brown fox jumps over the lazy dog.",
+            fontSize = (Ds.BODY_SP * previewFontScale).sp,
+            lineHeight = (Ds.BODY_SP * 1.4 * previewFontScale).sp,
+            color = theme.text
+          )
+        }
+      }
+    )
+  }
+
+  // Dialog: App Lock — set a 4-digit PIN, entered twice. The PIN is
+  // stored SHA-256 hashed, never plain text. "app_lock" turns on only
+  // once a PIN is saved. Forgot PIN requires reinstall — stated here.
+  if (showPinSetupDialog) {
+    AlertDialog(
+      onDismissRequest = { showPinSetupDialog = false },
+      confirmButton = {
+        Button(
+          onClick = {
+            val pin = pinSetupText.filter { it.isDigit() }
+            if (pin.length != 4) {
+              pinSetupError = "Enter exactly 4 digits"
+            } else if (pinStep == 0) {
+              pinFirst = pin
+              pinSetupText = ""
+              pinStep = 1
+            } else if (pin != pinFirst) {
+              pinSetupError = "PINs do not match — enter the PIN again"
+              pinStep = 0
+              pinFirst = ""
+              pinSetupText = ""
+            } else {
+              prefs.edit()
+                .putString("app_pin", hashPin(pin))
+                .putBoolean("app_lock", true)
+                .apply()
+              appLockOn = true
+              showPinSetupDialog = false
+              Toast.makeText(ctx, "App Lock ON", Toast.LENGTH_SHORT).show()
+            }
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+        ) {
+          Text(
+            if (pinStep == 0) "NEXT" else "SAVE PIN",
             fontFamily = PixelFont,
-            fontSize = 13.sp,
+            color = theme.textOnPrimary,
+            fontSize = (Ds.HINT_SP * fontScale).sp,
+            fontWeight = FontWeight.Bold
+          )
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { showPinSetupDialog = false }) {
+          Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+        }
+      },
+      title = {
+        Text(
+          if (pinStep == 0) "Set a 4-digit PIN" else "Enter the PIN again",
+          fontFamily = PixelFont,
+          fontWeight = FontWeight.Bold,
+          fontSize = 17.sp
+        )
+      },
+      text = {
+        Column {
+          OutlinedTextField(
+            value = pinSetupText,
+            onValueChange = {
+              pinSetupText = it.filter { c -> c.isDigit() }.take(4)
+              pinSetupError = ""
+            },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+            isError = pinSetupError.isNotEmpty(),
+            placeholder = { Text("••••", fontSize = (Ds.BODY_SP * fontScale).sp) },
+            modifier = Modifier.fillMaxWidth()
+          )
+          if (pinSetupError.isNotEmpty()) {
+            Spacer(Modifier.height(Ds.s8))
+            Text(
+              pinSetupError,
+              fontSize = (Ds.HINT_SP * fontScale).sp,
+              color = MaterialTheme.colorScheme.error
+            )
+          }
+          Spacer(Modifier.height(Ds.s8))
+          Text(
+            "If you forget this PIN, resetting it requires reinstalling the app.",
+            fontSize = (Ds.HINT_SP * fontScale).sp,
+            lineHeight = (Ds.HINT_SP * 1.4 * fontScale).sp,
             color = theme.textSecondary
           )
         }
-      )
-    }
+      }
+    )
+  }
 
-    // Modal: Privacy Policy
-    if (showPrivacyPolicy) {
-      AlertDialog(
-        onDismissRequest = { showPrivacyPolicy = false },
-        confirmButton = {
-          Button(
-            onClick = { showPrivacyPolicy = false },
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
-          ) {
-            Text("CLOSE", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
-        },
-        title = {
-          Text("Privacy Policy", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-        },
-        text = {
-          Box(Modifier.height(300.dp)) {
-            AndroidView(
-              factory = { context ->
-                WebView(context).apply {
-                  loadUrl("file:///android_asset/privacy_policy.html")
-                }
-              },
-              modifier = Modifier.fillMaxSize()
-            )
-          }
+  // Dialog: Clear Cache — shows the size, confirms, never deletes
+  // user files or History entries (only cache + temp working files).
+  if (showClearCacheDialog) {
+    AlertDialog(
+      onDismissRequest = { showClearCacheDialog = false },
+      confirmButton = {
+        Button(
+          onClick = {
+            vibrate()
+            try {
+              ctx.cacheDir.deleteRecursively()
+              val chamiTmp = File(ctx.getExternalFilesDir(null), "Chami/tmppdf")
+              if (chamiTmp.exists()) chamiTmp.deleteRecursively()
+              Toast.makeText(ctx, "Cache cleared", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+              e.printStackTrace()
+            }
+            refreshSizes()
+            showClearCacheDialog = false
+          },
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+        ) {
+          Text("CLEAR", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = (Ds.HINT_SP * fontScale).sp, fontWeight = FontWeight.Bold)
         }
-      )
-    }
+      },
+      dismissButton = {
+        TextButton(onClick = { showClearCacheDialog = false }) {
+          Text("CANCEL", fontFamily = PixelFont, color = theme.text)
+        }
+      },
+      title = {
+        Text("Clear Cache (${formatKb(cacheBytes)})?", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = (Ds.BODY_SP * fontScale).sp)
+      },
+      text = {
+        Text(
+          "This clears temporary files only. Your saved documents and History entries will not be deleted.",
+          fontSize = (Ds.BODY_SP * fontScale).sp,
+          lineHeight = (Ds.BODY_SP * 1.4 * fontScale).sp,
+          color = theme.textSecondary
+        )
+      }
+    )
+  }
+
+  // Dialog: Check for Updates — shown only when the store app is not
+  // available, so the check cannot be faked as "latest version".
+  if (showUpdateDialog) {
+    AlertDialog(
+      onDismissRequest = { showUpdateDialog = false },
+      confirmButton = {
+        TextButton(onClick = { showUpdateDialog = false }) {
+          Text("CLOSE", fontFamily = PixelFont, color = theme.primary)
+        }
+      },
+      title = {
+        Text("Check for Updates", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+      },
+      text = {
+        Text(
+          "This check needs the store app, which is not available on this device. " +
+            "You are on version ${BuildConfig.VERSION_NAME}. " +
+            "Open the store listing on your phone to check for a newer version.",
+          fontSize = (Ds.BODY_SP * fontScale).sp,
+          lineHeight = (Ds.BODY_SP * 1.4 * fontScale).sp,
+          color = theme.textSecondary
+        )
+      }
+    )
+  }
+
+  // Dialog: About — app name, versionName, package. Nothing else.
+  if (showAboutDialog) {
+    AlertDialog(
+      onDismissRequest = { showAboutDialog = false },
+      confirmButton = {
+        TextButton(onClick = { showAboutDialog = false }) {
+          Text("CLOSE", fontFamily = PixelFont, color = theme.primary)
+        }
+      },
+      title = {
+        Text("About", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+      },
+      text = {
+        Column {
+          Text(
+            "Chami PDF Maker",
+            fontSize = (Ds.BODY_SP * fontScale).sp,
+            fontWeight = FontWeight.Bold,
+            color = theme.text
+          )
+          Spacer(Modifier.height(Ds.s8))
+          Text(
+            "Version ${BuildConfig.VERSION_NAME}",
+            fontSize = (Ds.BODY_SP * fontScale).sp,
+            color = theme.textSecondary
+          )
+          Text(
+            "Package ${ctx.packageName}",
+            fontSize = (Ds.BODY_SP * fontScale).sp,
+            color = theme.textSecondary
+          )
+        }
+      }
+    )
+  }
+
+  // Fallback: bundled privacy policy (used only if no browser can open
+  // the live policy page).
+  if (showPrivacyPolicyFallback) {
+    AlertDialog(
+      onDismissRequest = { showPrivacyPolicyFallback = false },
+      confirmButton = {
+        Button(
+          onClick = { showPrivacyPolicyFallback = false },
+          colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
+        ) {
+          Text("CLOSE", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = (Ds.HINT_SP * fontScale).sp, fontWeight = FontWeight.Bold)
+        }
+      },
+      title = {
+        Text("Privacy Policy", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = (Ds.BODY_SP * fontScale).sp)
+      },
+      text = {
+        Box(Modifier.height(300.dp)) {
+          AndroidView(
+            factory = { context ->
+              WebView(context).apply {
+                loadUrl("file:///android_asset/privacy_policy.html")
+              }
+            },
+            modifier = Modifier.fillMaxSize()
+          )
+        }
+      }
+    )
   }
 }
