@@ -16,6 +16,6 @@
 local.properties
 .env
 debug.keystore
-# Pixel font TTF (Press Start 2P, OFL) — binary, not stored in the repo;
-# the GitHub Actions workflow downloads it into this folder at build time.
+# Pixel font TTF (Press Start 2P, OFL) — not stored in the repo; it is
+# embedded as Base64 in ui/PixelFontData.kt instead.
 app/src/main/res/font/
