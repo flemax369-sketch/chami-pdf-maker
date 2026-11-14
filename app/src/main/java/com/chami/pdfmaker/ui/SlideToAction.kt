@@ -1,10 +1,12 @@
 package com.chami.pdfmaker.ui
 
-import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -12,9 +14,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -37,94 +44,112 @@ import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /**
- * Phase 6 — slide-to-action, used by EVERY tool instead of a tap button
+ * Slide-to-action, used by EVERY tool instead of a tap button
  * (Slide to Convert / Merge / Split / Protect / Compress / Save PDF ...).
- * Drag the thumb to the end (~85% of the track) to confirm.
- * Haptic is always on: tick on slide start, small tick past 50%,
- * stronger tick on complete. Thumb animates back if released early.
+ * Drag the thumb to 90% of the track to confirm (spec §5).
+ *
+ * JANK FIX (audit §15/§18): the thumb offset is plain Float state
+ * updated DIRECTLY in the drag callback — no coroutine is launched
+ * per drag event (the old code launched one per pointer move).
+ * The only coroutine is the single snap-back animation launched
+ * once per gesture end / cancel.
+ *
+ * Haptics: light tick on slide start, ticks at 25% / 50% / 75%,
+ * success haptic on complete. Releasing before 90% slides back
+ * with no action.
+ *
+ * DISABLED STATE: pass [disabledReason] (e.g. "Select at least 2 PDFs
+ * to merge") and it is shown under the track, so the user always knows
+ * WHY the slide is unavailable. Call sites that do not pass one get a
+ * generic "finish the steps above" line — pass a real reason wherever
+ * the tool knows it.
  */
 @Composable
 fun SlideToAction(
   label: String,
   theme: ChamiTheme,
   enabled: Boolean = true,
+  disabledReason: String? = null,
   onSlideComplete: () -> Unit,
   modifier: Modifier = Modifier
 ) {
   val haptic = LocalHapticFeedback.current
   val scope = rememberCoroutineScope()
   val density = LocalDensity.current
-  val thumbSize = 56.dp
-  val trackHeight = 64.dp
+  // Spec §3/§5: track 56dp, handle 48dp (Ds.slideHeight / Ds.slideHandle).
+  val thumbSize = Ds.slideHandle
+  val trackHeight = Ds.slideHeight
   val thumbPx = with(density) { thumbSize.toPx() }
-  val edgePaddingPx = with(density) { 4.dp.toPx() }
+  val edgePaddingPx = with(density) { Ds.s4.toPx() }
   var trackWidthPx by remember { mutableStateOf(0f) }
   val maxOffset = (trackWidthPx - thumbPx - edgePaddingPx * 2).coerceAtLeast(0f)
-    val offset = remember { Animatable(0f) }
-  // Drag position tracked synchronously in plain state: Animatable.snapTo
-  // runs in a coroutine, so reading offset.value inside onDrag loses part
-  // of each delta on a fast swipe and the thumb can never reach 85%.
-  var dragOffset by remember { mutableStateOf(0f) }
-  var halfTicked by remember { mutableStateOf(false) }
+  // Plain state, updated synchronously on drag — never via a coroutine.
+  var dragOffset by remember { mutableFloatStateOf(0f) }
+  var lastTickMilestone by remember { mutableIntStateOf(0) }
   var completed by remember { mutableStateOf(false) }
 
-  val trackColor = if (enabled) Color(0xFFDCFCE7) else Color(0xFFE2E8F0)
-  val thumbColor = if (enabled) theme.primary else Color(0xFF94A3B8)
-  val labelColor = if (enabled) theme.text else Color(0xFF94A3B8)
+  val trackColor = if (enabled) ChamiColors.lightGreen else theme.cardBorder
+  val thumbColor = if (enabled) ChamiColors.brightGreen else ChamiColors.secondaryText.copy(alpha = 0.6f)
+  val labelColor = if (enabled) ChamiColors.deepGreen else ChamiColors.secondaryText
 
-  Box(
-    modifier = modifier
-      .fillMaxWidth()
-      .height(trackHeight)
-      .onSizeChanged { trackWidthPx = it.width.toFloat() }
-      .clip(RoundedCornerShape(32.dp))
-      .background(trackColor),
-    contentAlignment = Alignment.Center
-  ) {
-    // Green fill that grows behind the thumb as it slides.
-    if (enabled && offset.value > 0f) {
-      Box(
-        Modifier
-          .align(Alignment.CenterStart)
-          .fillMaxWidth()
-          .height(trackHeight),
-        contentAlignment = Alignment.CenterStart
-      ) {
-        Box(
-          Modifier
-            .size(width = (offset.value + thumbPx + edgePaddingPx * 2).let { px ->
-              with(density) { px.toDp() }
-            }, height = trackHeight)
-            .background(theme.primary.copy(alpha = 0.25f))
-        )
+  /** One snap-back animation per gesture end — the only coroutine here. */
+  fun animateOffsetTo(target: Float) {
+    val start = dragOffset
+    scope.launch {
+      animate(start, target, animationSpec = tween(300)) { value, _ ->
+        dragOffset = value
       }
     }
-    Text(
-      text = label,
-      fontFamily = PixelFont,
-      fontSize = 14.sp,
-      fontWeight = FontWeight.Bold,
-      color = labelColor
-    )
+  }
+
+  Column(modifier = modifier.fillMaxWidth()) {
     Box(
       modifier = Modifier
-        .align(Alignment.CenterStart)
-        .padding(start = 4.dp)
-        .offset { IntOffset(offset.value.roundToInt(), 0) }
-        .size(thumbSize)
-        .clip(CircleShape)
-        .background(thumbColor)
-        .pointerInput(enabled, maxOffset) {
-          if (!enabled) return@pointerInput
-          detectDragGestures(
-            onDragStart = {
-              halfTicked = false
-              dragOffset = offset.value
-              try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-            },
-            onDragEnd = {
-              scope.launch {
-                if (maxOffset > 0f && dragOffset >= 0.85f * maxOffset) {
+        .fillMaxWidth()
+        .height(trackHeight)
+        .onSizeChanged { trackWidthPx = it.width.toFloat() }
+        // Half the track height — the track is a pill, so the radius is
+        // derived from its height, not a spacing token.
+        .clip(RoundedCornerShape(trackHeight / 2))
+        .background(trackColor),
+      contentAlignment = Alignment.Center
+    ) {
+      // Green fill that grows behind the thumb as it slides.
+      if (enabled && dragOffset > 0f) {
+        Box(
+          Modifier
+            .align(Alignment.CenterStart)
+            .size(
+              width = with(density) { (dragOffset + thumbPx + edgePaddingPx * 2).toDp() },
+              height = trackHeight
+            )
+            .background(ChamiColors.brightGreen.copy(alpha = 0.25f))
+        )
+      }
+      Text(
+        text = label,
+        fontSize = Ds.BUTTON_SP.sp,
+        fontWeight = FontWeight.SemiBold,
+        lineHeight = (Ds.BUTTON_SP * 1.4).sp,
+        color = labelColor
+      )
+      Box(
+        modifier = Modifier
+          .align(Alignment.CenterStart)
+          .padding(start = Ds.s4)
+          .offset { IntOffset(dragOffset.roundToInt(), 0) }
+          .size(thumbSize)
+          .clip(CircleShape)
+          .background(thumbColor)
+          .pointerInput(enabled, maxOffset) {
+            if (!enabled) return@pointerInput
+            detectDragGestures(
+              onDragStart = {
+                lastTickMilestone = 0
+                try { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) } catch (_: Exception) {}
+              },
+              onDragEnd = {
+                if (maxOffset > 0f && dragOffset >= 0.9f * maxOffset) {
                   if (!completed) {
                     completed = true
                     try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
@@ -134,28 +159,49 @@ fun SlideToAction(
                     completed = false
                   }
                 }
-                offset.animateTo(0f, tween(300))
-                dragOffset = 0f
+                animateOffsetTo(0f)
+              },
+              onDragCancel = {
+                animateOffsetTo(0f)
+              },
+              onDrag = { change, dragAmount ->
+                change.consume()
+                // Direct state update — no coroutine per drag event.
+                dragOffset = (dragOffset + dragAmount.x).coerceIn(0f, maxOffset)
+                if (maxOffset > 0f) {
+                  val pct = (dragOffset / maxOffset * 100).toInt()
+                  val milestone = when {
+                    pct >= 75 -> 75
+                    pct >= 50 -> 50
+                    pct >= 25 -> 25
+                    else -> 0
+                  }
+                  if (milestone > lastTickMilestone) {
+                    lastTickMilestone = milestone
+                    try { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) } catch (_: Exception) {}
+                  }
+                }
               }
-            },
-            onDragCancel = {
-              dragOffset = 0f
-              scope.launch { offset.animateTo(0f, tween(300)) }
-            },
-            onDrag = { change, dragAmount ->
-              change.consume()
-              dragOffset = (dragOffset + dragAmount.x).coerceIn(0f, maxOffset)
-              scope.launch { offset.snapTo(dragOffset) }
-              if (!halfTicked && maxOffset > 0f && dragOffset >= 0.5f * maxOffset) {
-                halfTicked = true
-                try { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) } catch (_: Exception) {}
-              }
-            }
-          )
-        },
-      contentAlignment = Alignment.Center
-    ) {
-      Text("→", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+            )
+          },
+        contentAlignment = Alignment.Center
+      ) {
+        Icon(
+          Icons.Filled.ArrowForward,
+          contentDescription = "Slide",
+          tint = Color.White,
+          modifier = Modifier.size(24.dp)
+        )
+      }
+    }
+    if (!enabled) {
+      Spacer(Modifier.height(Ds.s4))
+      Text(
+        text = disabledReason ?: "Not ready yet — finish the steps above first.",
+        fontSize = Ds.HINT_SP.sp,
+        lineHeight = (Ds.HINT_SP * 1.4).sp,
+        color = ChamiColors.secondaryText
+      )
     }
   }
 }
