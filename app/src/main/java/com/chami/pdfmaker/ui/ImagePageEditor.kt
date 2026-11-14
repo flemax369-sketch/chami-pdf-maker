@@ -159,12 +159,22 @@ object ImagePageEditor {
     return warpQuad(bmp, pts, outW, outH)
   }
 
-  // AUTO-DETECT EDGES — lightweight, honest detector, NOT ML / OpenCV.
-  // It is a luminance bounding box only: it finds the bounding box of
-  // the darker-than-background content, NOT the true paper edges, so on
-  // a busy background it can be wrong — the user then drags the corners.
-  // Phase 6 improvements over the old fixed-threshold version:
-  // downscale to ~300px wide, adaptive threshold from the MEAN luminance
+  // STRAIGHTEN (perspective) — the ONLY path that warps. Separated
+  // from Crop by design (spec §6): crop CUTS (cropToRect), straighten
+  // flattens a tilted page (this function). Callers must offer it
+  // behind its own Straighten button, never as the crop default.
+  // cropToQuad is kept as the implementation for that path.
+  fun straightenQuad(bmp: Bitmap, quadFractions: List<Offset>, zoom: Float = 1f): Bitmap =
+    cropToQuad(bmp, quadFractions, zoom)
+
+  // AUTO-DETECT EDGES — GUIDE SUGGESTION ONLY, never auto-apply.
+  // Lightweight, honest detector, NOT ML / OpenCV: it is a luminance
+  // bounding box only — it finds the bounding box of the
+  // darker-than-background content, NOT the true paper edges, so on
+  // a busy background it can be wrong. Callers must show the suggested
+  // corners and let the user drag every one before applying; the
+  // suggestion must never be applied silently.
+  // Downscale to ~300px wide, adaptive threshold from the MEAN luminance
   // of the downscaled image (mean * 0.9, clamped 60..235) instead of a
   // fixed 235, 2% inset, full-frame fallback when almost nothing is found.
   fun detectDocumentQuad(bmp: Bitmap): List<Offset> {
@@ -297,13 +307,19 @@ object ImagePageEditor {
     }
 }
 
-// Crop ratios offered in the crop editor. Label to ratio (null = Original).
-private val CROP_RATIOS: List<Pair<String, Float?>> = listOf(
-  "Original" to null,
-  "A4" to 1.414f,
-  "4:3" to 1.333f,
-  "1:1" to 1.0f,
-  "3:2" to 1.5f
+// Crop ratios offered in the crop editor. Free = no ratio lock (corners
+// move independently); Original = the image's own aspect ratio;
+// the rest are width/height ratios the frame must keep while dragging.
+private data class CropRatioOption(val label: String, val ratio: Float?, val free: Boolean = false)
+
+private val CROP_RATIOS: List<CropRatioOption> = listOf(
+  CropRatioOption("Free", null, free = true),
+  CropRatioOption("Original", null),
+  CropRatioOption("1:1", 1.0f),
+  CropRatioOption("3:4", 0.75f),
+  CropRatioOption("4:3", 1.333f),
+  CropRatioOption("16:9", 1.778f),
+  CropRatioOption("A4", 1.414f)
 )
 
 // PERFORMANCE: downscale a page bitmap to ~200px wide for the thumbnail
@@ -325,19 +341,29 @@ private fun thumbnailBitmap(cache: MutableMap<Uri, ImageBitmap>, page: PageItem)
   return thumb
 }
 
-// FULL-SCREEN crop editor (Phase 6): a Dialog with usePlatformDefaultWidth
-// = false, so it fills the screen instead of a small AlertDialog. The
-// image is large and centred, the crop frame is a TRUE 4-corner QUAD
-// POLYGON drawn with Canvas (actual quad lines + corner handles, NOT the
-// bounding rectangle), with a light rule-of-thirds grid over the image.
-// Corner handles: 48dp touch target, ~20dp visible dot, draggable freely
-// in x and y, clamped inside the image, cannot cross the opposite corner.
-// Edge midpoint handles (4) drag that edge's two corners together.
-// While a handle is dragged a circular 2x magnifier loupe shows the area
-// around the finger, positioned above it. Preset ratios only set a
-// starting rectangle — corners can then be dragged freely from there.
-// Pinch zoom 1-3x still works. onApply calls cropToQuad, so the crop
-// VISIBLY applies. Signature unchanged from Phase 5.
+// FULL-SCREEN crop editor (Phase 6, fixed 2026-11-14): a Dialog with
+// usePlatformDefaultWidth = false, so it fills the screen instead of a
+// small AlertDialog. CROP IS THE DEFAULT and crop CUTS: Apply calls
+// cropToRect, which removes everything outside the frame and never
+// bends the image. STRAIGHTEN is a separate mode (its own toggle at
+// the top): only there do the four corners move independently and
+// Apply calls straightenQuad / cropToQuad (perspective warp). Ratio
+// presets (Free / Original / 1:1 / 3:4 / 4:3 / 16:9 / A4) set the frame
+// in Crop mode and the frame KEEPS that ratio while a corner or edge
+// is dragged; in Straighten mode a preset only sets the starting quad.
+// The frame is a TRUE 4-corner QUAD POLYGON in Straighten mode and a
+// true rectangle in Crop mode, drawn with Canvas (actual lines +
+// corner handles, NOT the bounding rectangle), with a light
+// rule-of-thirds grid over the image. Corner handles: 48dp touch
+// target (Ds.minTouch), ~20dp visible dot (documented one-off: the
+// visible dot is deliberately smaller than its touch target),
+// draggable freely in x and y, clamped inside the image, cannot cross
+// the opposite corner. Edge midpoint handles (4) drag that edge's two
+// corners together. While a handle is dragged a circular 2x magnifier
+// loupe shows the area around the finger, positioned above it.
+// Auto-detect only SUGGESTS corners (luminance guide, see
+// detectDocumentQuad) — it never applies anything by itself. Pinch
+// zoom 1-3x still works. Signature unchanged from Phase 5.
 @Composable
 fun CropEditorDialog(
   bitmap: Bitmap,
@@ -362,7 +388,19 @@ fun CropEditorDialog(
     )
   }
   var zoom by remember(bitmap) { mutableStateOf(1f) }
+  // Crop (cut) is the DEFAULT mode. Straighten (warp) is opt-in via
+  // its own toggle and never runs from the Crop path.
+  var straightenMode by remember(bitmap) { mutableStateOf(false) }
+  // Active ratio lock in Crop mode: null = Free (no lock); otherwise
+  // width/height the frame must keep while dragging. A preset sets it;
+  // Free clears it. Straighten mode ignores it (corners move freely).
+  var activeRatio by remember(bitmap) { mutableStateOf<Float?>(null) }
   val density = LocalDensity.current
+
+  // Apply for the current mode: CUT by default, warp only in Straighten.
+  fun applyCurrentMode(): Bitmap =
+    if (straightenMode) ImagePageEditor.straightenQuad(bitmap, quad, zoom)
+    else ImagePageEditor.cropToRect(bitmap, cropRect, zoom)
 
   fun quadFromRect(r: Rect): List<Offset> =
     listOf(Offset(r.left, r.top), Offset(r.right, r.top), Offset(r.right, r.bottom), Offset(r.left, r.bottom))
@@ -388,7 +426,7 @@ fun CropEditorDialog(
     properties = DialogProperties(usePlatformDefaultWidth = false)
   ) {
     Column(
-      modifier = Modifier.fillMaxSize().background(Color.Black).padding(12.dp)
+      modifier = Modifier.fillMaxSize().background(Color.Black).padding(Ds.s12)
     ) {
       // Top bar: CANCEL (left), title, APPLY (right).
       Row(
@@ -397,28 +435,54 @@ fun CropEditorDialog(
         verticalAlignment = Alignment.CenterVertically
       ) {
         TextButton(onClick = onDismiss) {
-          Text("CANCEL", fontFamily = PixelFont, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          Text("CANCEL", fontFamily = PixelFont, color = Color.White, fontSize = Ds.HINT_SP.sp, fontWeight = FontWeight.Bold)
         }
         Text(
-          "FREE CROP",
+          if (straightenMode) "STRAIGHTEN" else "CROP",
           fontFamily = PixelFont, fontWeight = FontWeight.Bold,
-          fontSize = 14.sp, color = Color.White
+          fontSize = Ds.BODY_SP.sp, color = Color.White
         )
         Button(
-          onClick = { onApply(ImagePageEditor.cropToQuad(bitmap, quad, zoom)) },
+          onClick = { onApply(applyCurrentMode()) },
           colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-          shape = RoundedCornerShape(8.dp),
-          contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp)
+          shape = RoundedCornerShape(Ds.buttonRadius),
+          contentPadding = PaddingValues(horizontal = Ds.s16, vertical = 0.dp)
         ) {
-          Text("APPLY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          Text("APPLY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = Ds.HINT_SP.sp, fontWeight = FontWeight.Bold)
         }
       }
-      Spacer(Modifier.height(8.dp))
+      Spacer(Modifier.height(Ds.s8))
+      // Mode toggle: Crop (cut) is the default; Straighten (warp) is a
+      // separate, explicit choice — never the crop default.
+      Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+        Button(
+          onClick = { straightenMode = false },
+          modifier = Modifier.weight(1f).height(Ds.minTouch),
+          colors = ButtonDefaults.buttonColors(
+            containerColor = if (!straightenMode) theme.primary else Color.Transparent
+          ),
+          shape = RoundedCornerShape(Ds.buttonRadius),
+          border = androidx.compose.foundation.BorderStroke(1.dp, theme.primary)
+        ) {
+          Text("CROP — CUT", fontFamily = PixelFont, color = if (!straightenMode) theme.textOnPrimary else Color.White, fontSize = Ds.HINT_SP.sp, fontWeight = FontWeight.Bold)
+        }
+        OutlinedButton(
+          onClick = { straightenMode = true },
+          modifier = Modifier.weight(1f).height(Ds.minTouch),
+          shape = RoundedCornerShape(Ds.buttonRadius),
+          border = androidx.compose.foundation.BorderStroke(1.dp, Color.White),
+          colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+        ) {
+          Text("STRAIGHTEN", fontFamily = PixelFont, fontSize = Ds.HINT_SP.sp, fontWeight = FontWeight.Bold, color = Color.White)
+        }
+      }
+      Spacer(Modifier.height(Ds.s8))
       Text(
-        "Drag a green corner freely to crop — corners move on their own, so tilted pages straighten. Pinch to zoom.",
-        fontFamily = PixelFont, fontSize = 11.sp, color = Color(0xFFCBD5E1)
+        if (straightenMode) "Straighten flattens a tilted page — corners move on their own and the perspective is corrected. This is separate from Crop."
+        else "Crop cuts the image — everything outside the frame is removed. Drag a corner or edge to cut. Pinch to zoom.",
+        fontFamily = PixelFont, fontSize = Ds.HINT_SP.sp, color = Color.White.copy(alpha = 0.7f)
       )
-      Spacer(Modifier.height(8.dp))
+      Spacer(Modifier.height(Ds.s8))
 
       // Large centred image area (fills the remaining height).
       BoxWithConstraints(
@@ -439,7 +503,86 @@ fun CropEditorDialog(
         // The loupe follows this handle's point.
         var activeHandle by remember { mutableStateOf<Int?>(null) }
 
+        // Frame corners in the current mode: the free quad in
+        // Straighten mode, the axis-aligned rectangle in Crop mode.
+        fun frameCorners(): List<Offset> =
+          if (straightenMode) quad else quadFromRect(cropRect)
+
+        // CROP (cut) corner drag: move one rectangle corner; the
+        // opposite corner stays put, so the frame stays a rectangle and
+        // the result is a cut, never a warp. With a ratio preset active
+        // the width drives the height (anchored at the opposite corner)
+        // so the frame KEEPS that ratio while dragging.
+        fun moveRectCorner(corner: Int, dx: Float, dy: Float) {
+          val fx = dx / dispW; val fy = dy / dispH
+          var l = cropRect.left; var t = cropRect.top
+          var r = cropRect.right; var b = cropRect.bottom
+          when (corner) {
+            0 -> { l = (l + fx).coerceIn(0f, r - minSide); t = (t + fy).coerceIn(0f, b - minSide) }
+            1 -> { r = (r + fx).coerceIn(l + minSide, 1f); t = (t + fy).coerceIn(0f, b - minSide) }
+            2 -> { r = (r + fx).coerceIn(l + minSide, 1f); b = (b + fy).coerceIn(t + minSide, 1f) }
+            else -> { l = (l + fx).coerceIn(0f, r - minSide); b = (b + fy).coerceIn(t + minSide, 1f) }
+          }
+          val ratio = activeRatio
+          if (ratio != null) {
+            var w = r - l
+            var h = w / ratio
+            val availH = if (corner == 0 || corner == 1) b else 1f - t
+            if (h > availH) {
+              h = availH.coerceAtLeast(minSide)
+              w = h * ratio
+              when (corner) {
+                0, 3 -> l = r - w
+                else -> r = l + w
+              }
+            }
+            when (corner) {
+              0, 1 -> t = (b - h).coerceIn(0f, b - minSide)
+              else -> b = (t + h).coerceIn(t + minSide, 1f)
+            }
+          }
+          cropRect = Rect(l, t, r, b)
+          quad = quadFromRect(cropRect)
+        }
+
+        // CROP (cut) edge drag: move one rectangle edge. With a ratio
+        // preset active the dragged dimension drives the other one,
+        // centred on the frame, so the ratio is kept.
+        fun moveRectEdge(edge: Int, dx: Float, dy: Float) {
+          val fx = dx / dispW; val fy = dy / dispH
+          var l = cropRect.left; var t = cropRect.top
+          var r = cropRect.right; var b = cropRect.bottom
+          when (edge) {
+            0 -> t = (t + fy).coerceIn(0f, b - minSide)
+            1 -> r = (r + fx).coerceIn(l + minSide, 1f)
+            2 -> b = (b + fy).coerceIn(t + minSide, 1f)
+            else -> l = (l + fx).coerceIn(0f, r - minSide)
+          }
+          val ratio = activeRatio
+          if (ratio != null) {
+            if (edge == 0 || edge == 2) {
+              val h = b - t
+              var w = h * ratio
+              val cx = (l + r) / 2f
+              if (w > 1f) { w = 1f }
+              l = (cx - w / 2f).coerceIn(0f, 1f - w)
+              r = l + w
+            } else {
+              val w = r - l
+              var h = w / ratio
+              val cy = (t + b) / 2f
+              if (h > 1f) { h = 1f }
+              t = (cy - h / 2f).coerceIn(0f, 1f - h)
+              b = t + h
+            }
+          }
+          cropRect = Rect(l, t, r, b)
+          quad = quadFromRect(cropRect)
+        }
+
         fun moveCorner(corner: Int, dx: Float, dy: Float) {
+          // Crop mode cuts a rectangle; only Straighten moves quad corners.
+          if (!straightenMode) { moveRectCorner(corner, dx, dy); return }
           val fx = dx / dispW; val fy = dy / dispH
           val cur = quad[corner]
           val opp = quad[(corner + 2) % 4]
@@ -452,6 +595,8 @@ fun CropEditorDialog(
         }
 
         fun moveEdge(edge: Int, dx: Float, dy: Float) {
+          // Crop mode moves a rectangle edge; only Straighten moves quad edges.
+          if (!straightenMode) { moveRectEdge(edge, dx, dy); return }
           val fx = dx / dispW; val fy = dy / dispH
           val ends = when (edge) {
             0 -> 0 to 1 // top
@@ -480,7 +625,8 @@ fun CropEditorDialog(
             2 -> 2 to 3
             else -> 3 to 0
           }
-          val a = quad[ends.first]; val b = quad[ends.second]
+          val corners = frameCorners()
+          val a = corners[ends.first]; val b = corners[ends.second]
           return Offset((a.x + b.x) / 2f, (a.y + b.y) / 2f)
         }
 
@@ -508,9 +654,10 @@ fun CropEditorDialog(
             contentScale = ContentScale.FillBounds
           )
 
-          // TRUE QUAD POLYGON + rule-of-thirds grid, drawn on Canvas over
-          // the image. This draws the actual quad lines, NOT the bounding
-          // rectangle — what you see is the crop you get.
+          // TRUE FRAME + rule-of-thirds grid, drawn on Canvas over
+          // the image. In Straighten mode this draws the actual quad
+          // lines; in Crop mode the rectangle lines — what you see is
+          // the crop you get.
           Canvas(modifier = Modifier.fillMaxSize()) {
             val grid = Color.White.copy(alpha = 0.35f)
             val thirdW = size.width / 3f
@@ -519,23 +666,23 @@ fun CropEditorDialog(
             drawLine(grid, Offset(thirdW * 2f, 0f), Offset(thirdW * 2f, size.height), strokeWidth = 1f)
             drawLine(grid, Offset(0f, thirdH), Offset(size.width, thirdH), strokeWidth = 1f)
             drawLine(grid, Offset(0f, thirdH * 2f), Offset(size.width, thirdH * 2f), strokeWidth = 1f)
-            val pts = quad.map { Offset(it.x * size.width, it.y * size.height) }
+            val pts = frameCorners().map { Offset(it.x * size.width, it.y * size.height) }
             for (i in 0 until 4) {
               drawLine(theme.primary, pts[i], pts[(i + 1) % 4], strokeWidth = 4f)
             }
           }
 
           // Corner handles: 48dp touch target, 20dp visible dot inside.
-          quad.forEachIndexed { corner, pt ->
+          frameCorners().forEachIndexed { corner, pt ->
             Box(
               Modifier
                 .offset {
                   IntOffset(
-                    (pt.x * dispW).roundToInt() - with(density) { 24.dp.toPx() }.roundToInt(),
-                    (pt.y * dispH).roundToInt() - with(density) { 24.dp.toPx() }.roundToInt()
+                    (pt.x * dispW).roundToInt() - with(density) { Ds.minTouch.toPx() / 2f }.roundToInt(),
+                    (pt.y * dispH).roundToInt() - with(density) { Ds.minTouch.toPx() / 2f }.roundToInt()
                   )
                 }
-                .size(48.dp)
+                .size(Ds.minTouch)
                 .pointerInput(corner, bitmap) {
                   detectDragGestures(
                     onDragStart = { activeHandle = corner },
@@ -563,11 +710,11 @@ fun CropEditorDialog(
               Modifier
                 .offset {
                   IntOffset(
-                    (mid.x * dispW).roundToInt() - with(density) { 24.dp.toPx() }.roundToInt(),
-                    (mid.y * dispH).roundToInt() - with(density) { 24.dp.toPx() }.roundToInt()
+                    (mid.x * dispW).roundToInt() - with(density) { Ds.minTouch.toPx() / 2f }.roundToInt(),
+                    (mid.y * dispH).roundToInt() - with(density) { Ds.minTouch.toPx() / 2f }.roundToInt()
                   )
                 }
-                .size(48.dp)
+                .size(Ds.minTouch)
                 // NOTE: keys are (edge, bitmap) only — NOT quad. Quad
                 // changes on every drag move; keying on it would restart
                 // pointerInput and cancel the drag mid-gesture.
@@ -598,13 +745,17 @@ fun CropEditorDialog(
         // positioned above the finger (clamped inside the image area).
         // Sits OUTSIDE the zoomed Box so the pinch scale does not move it.
         activeHandle?.let { handle ->
-          val focus = if (handle < 4) quad[handle] else edgeMid(handle - 4)
+          val focus = if (handle < 4) frameCorners()[handle] else edgeMid(handle - 4)
           val fx = focus.x * dispW
           val fy = focus.y * dispH
+          // 120dp loupe and the 20dp / 16dp visible dots below are documented
+          // one-offs: the touch target is the 48dp token, the visible dot
+          // and the magnifier are deliberately larger than the spec's 72dp
+          // loupe, kept from Phase 6 so the pixel under the finger is legible.
           val loupePx = with(density) { 120.dp.toPx() }
           val half = loupePx / 2f
           val loupeX = (fx - half).coerceIn(0f, (dispW - loupePx).coerceAtLeast(0f))
-          val loupeY = (fy - loupePx - with(density) { 24.dp.toPx() }).coerceIn(0f, (dispH - loupePx).coerceAtLeast(0f))
+          val loupeY = (fy - loupePx - with(density) { Ds.s24.toPx() }).coerceIn(0f, (dispH - loupePx).coerceAtLeast(0f))
           Box(
             Modifier
               .offset { IntOffset((offXPx + loupeX).roundToInt(), (offYPx + loupeY).roundToInt()) }
@@ -633,66 +784,86 @@ fun CropEditorDialog(
         }
       }
 
-      Spacer(Modifier.height(8.dp))
+      Spacer(Modifier.height(Ds.s8))
       Text(
         "Zoom: ${"%.1f".format(zoom)}x",
-        fontFamily = PixelFont, fontSize = 11.sp, color = Color(0xFFCBD5E1)
+        fontFamily = PixelFont, fontSize = Ds.HINT_SP.sp, color = Color.White.copy(alpha = 0.7f)
       )
-      Spacer(Modifier.height(8.dp))
+      Spacer(Modifier.height(Ds.s8))
 
-      // Preset ratios — set a starting rectangle only.
+      // Preset ratios. In Crop mode a preset sets the frame AND locks
+      // the ratio while dragging (Free clears the lock); in Straighten
+      // mode it only sets the starting quad, corners then move freely.
       Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(Ds.s8),
         modifier = Modifier.fillMaxWidth()
       ) {
-        CROP_RATIOS.forEach { (label, ratio) ->
+        CROP_RATIOS.forEach { opt ->
           OutlinedButton(
-            onClick = { cropRect = ratioRect(ratio); quad = quadFromRect(cropRect) },
-            modifier = Modifier.weight(1f).height(36.dp),
-            shape = RoundedCornerShape(6.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF475569)),
+            onClick = {
+              if (opt.free) {
+                activeRatio = null
+              } else {
+                // Original = the image's own aspect ratio.
+                val effRatio = opt.ratio ?: (bitmap.width.toFloat() / bitmap.height.toFloat())
+                activeRatio = effRatio
+                cropRect = ratioRect(effRatio); quad = quadFromRect(cropRect)
+              }
+            },
+            modifier = Modifier.weight(1f).height(Ds.minTouch),
+            shape = RoundedCornerShape(Ds.buttonRadius),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.7f)),
             colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
             contentPadding = PaddingValues(0.dp)
           ) {
-            Text(label, fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(opt.label, fontFamily = PixelFont, fontSize = Ds.NAV_SP.sp, fontWeight = FontWeight.Bold, color = Color.White)
           }
         }
       }
-      Spacer(Modifier.height(8.dp))
+      Spacer(Modifier.height(Ds.s8))
 
-      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        // Auto-detect edges (adaptive luminance bounding box — not ML /
-        // OpenCV, see ImagePageEditor.detectDocumentQuad). Sets the corners.
+      Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+        // Suggest edges (guide only): a luminance bounding box, NOT
+        // true edge detection. It only sets the corners for the user
+        // to drag — it never applies anything by itself.
         OutlinedButton(
           onClick = {
             val detected = ImagePageEditor.detectDocumentQuad(bitmap)
             quad = detected
             syncRectFromQuad()
           },
-          modifier = Modifier.weight(1f).height(44.dp),
-          shape = RoundedCornerShape(8.dp),
-          border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF475569)),
+          modifier = Modifier.weight(1f).height(Ds.minTouch),
+          shape = RoundedCornerShape(Ds.buttonRadius),
+          border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.7f)),
           colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
         ) {
-          Text("AUTO-DETECT EDGES", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+          Text("SUGGEST EDGES", fontFamily = PixelFont, fontSize = Ds.NAV_SP.sp, fontWeight = FontWeight.Bold, color = Color.White)
         }
         Button(
           onClick = onRotate,
-          modifier = Modifier.weight(1f).height(44.dp),
+          modifier = Modifier.weight(1f).height(Ds.minTouch),
           colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-          shape = RoundedCornerShape(8.dp)
+          shape = RoundedCornerShape(Ds.buttonRadius)
         ) {
-          Text("ROTATE 90°", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+          Text("ROTATE 90°", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = Ds.HINT_SP.sp, fontWeight = FontWeight.Bold)
         }
       }
-      Spacer(Modifier.height(8.dp))
+      Spacer(Modifier.height(Ds.s8))
+      Text(
+        "Edge suggestion is a brightness guide only, not true edge detection — drag the corners to fix it before applying.",
+        fontFamily = PixelFont, fontSize = Ds.HINT_SP.sp, color = Color.White.copy(alpha = 0.7f)
+      )
+      Spacer(Modifier.height(Ds.s8))
       Button(
-        onClick = { onApply(ImagePageEditor.cropToQuad(bitmap, quad, zoom)) },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
+        onClick = { onApply(applyCurrentMode()) },
+        modifier = Modifier.fillMaxWidth().height(Ds.minTouch),
         colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-        shape = RoundedCornerShape(8.dp)
+        shape = RoundedCornerShape(Ds.buttonRadius)
       ) {
-        Text("APPLY CROP", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text(
+          if (straightenMode) "APPLY STRAIGHTEN" else "APPLY CROP",
+          fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = Ds.HINT_SP.sp, fontWeight = FontWeight.Bold
+        )
       }
     }
   }
