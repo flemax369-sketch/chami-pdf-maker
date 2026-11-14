@@ -5,8 +5,7 @@
   <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
-  <uses-permission android:name="android.permission.INTERNET"/>
-  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+  <!-- No INTERNET / ACCESS_NETWORK_STATE: offline-first, no network calls. -->
   <uses-feature android:name="android.hardware.camera" android:required="false"/>
   <application
       android:allowBackup="true"
