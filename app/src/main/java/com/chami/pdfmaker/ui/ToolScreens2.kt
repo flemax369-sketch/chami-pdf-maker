@@ -1488,8 +1488,7 @@ fun PdfReaderScreen(
   var goToInput by remember { mutableStateOf("") }
   var showOverflow by remember { mutableStateOf(false) }
 
-  val fileName: String
-    get() = pdfUri?.let { displayNameOf(ctx, it) } ?: initialFile?.name ?: "file"
+  val fileName: String = pdfUri?.let { displayNameOf(ctx, it) } ?: initialFile?.name ?: "file"
 
   fun vibrate() {
     if (tm.hapticOn()) {
