@@ -982,8 +982,7 @@ fun RectCropDialog(
         TextButton(
           onClick = {
             try {
-              val androidRect = Rect(rect.left, rect.top, rect.right, rect.bottom)
-              onApply(ImagePageEditor.cropToRect(bitmap, androidRect, 1f))
+              onApply(ImagePageEditor.cropToRect(bitmap, rect, 1f))
             } catch (_: Exception) { onDismiss() }
           },
           modifier = Modifier.height(Ds.minTouch)
@@ -1317,7 +1316,7 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     progressText = "Page 1 of ${pages.size}"
     scope.launch {
       val out = PdfEngine.outFile(ctx, "IMG_PDF_${System.currentTimeMillis()}.pdf")
-      val options = ImagesPdfOptions(
+      val options = PdfEngine.ImagesPdfOptions(
         pageSize = pageSize,
         quality = quality,
         watermarkText = if (watermarkOn) watermarkText.trim() else "",
@@ -1596,7 +1595,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     progressText = "Page 1 of ${pages.size}"
     scope.launch {
       val out = PdfEngine.outFile(ctx, "Scan_${System.currentTimeMillis()}.pdf")
-      val options = ImagesPdfOptions(
+      val options = PdfEngine.ImagesPdfOptions(
         pageSize = pageSize,
         quality = quality,
         watermarkText = if (watermarkOn) watermarkText.trim() else "",
