@@ -89,6 +89,8 @@ dependencies {
   implementation(libs.androidx.compose.ui.graphics)
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.compose.material3)
+  implementation(libs.androidx.compose.material.icons.core)
+  implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -96,6 +98,7 @@ dependencies {
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation("com.google.mlkit:text-recognition:16.0.0")
+  implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
   // Phase 6: ads removed — play-services-ads dependency deleted (no code imports it).
   // Phase 6: CameraX for the in-app Scan camera (ScanCameraScreen).
   // Versions come from gradle/libs.versions.toml (1.5.0 — newer stable than
