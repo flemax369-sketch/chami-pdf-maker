@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -15,40 +16,46 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.scrollBy
-import androidx.compose.ui.unit.Dp
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.geometry.Rect as ComposeRect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -57,14 +64,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.chami.pdfmaker.pdf.*
 import com.chami.pdfmaker.theme.ChamiTheme
 import com.chami.pdfmaker.theme.ThemeManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -74,26 +88,91 @@ import java.security.MessageDigest
 
 // ---------------------------------------------------------------------------
 // PHASE 6 — NO ADS in this build (user decision 2026-11-13): no interstitial
-// before a file is made, no banner, no AdMob anywhere in this file. Build
-// actions are called directly. AdsManager is never referenced here.
+// before a file is made, no banner, no AdMob anywhere in this file.
 // ---------------------------------------------------------------------------
+//
+// FIX NOTES (2026-11-14 rewrite, audit chami-whole-app-audit-2026-11-14):
+// - Images/Scan build through PdfEngine.buildImagesPdf(ctx, List<Bitmap>,
+//   ImagesPdfOptions, onProgress) — the shared engine API (merged from the
+//   engine batch). The old buildImagesPdfWithOptions (duplicate engine,
+//   wrong quality/watermark/Original-size behaviour) is deleted.
+// - OcrHelper exposes ocrImage(ctx, uri, language); language chips use it
+//   (Hindi = Devanagari recogniser, Spanish = Latin).
+// - ImagePageEditor.kt is unchanged in this copy, so its CropEditorDialog
+//   still warps (cropToQuad). Crop therefore uses the new RectCropDialog
+//   below (true rectangular CUT via ImagePageEditor.cropToRect); the warp
+//   dialog is only opened from the separate "Straighten" button.
+// - PdfProtector already exposes unlockPdf / setPermissions /
+//   verifyPassword in this copy; Protect uses them instead of the old
+//   local RC4 unlock (kept only where still needed: patchPdfPermissions).
+// - ReaderTextTools already exposes saveBookmark / getBookmarks
+//   (SharedPreferences "chami_bookmarks"); the Reader uses them, plus a
+//   local removeBookmark with the same key scheme.
+
+// --- Shared engine-facing helpers ----------------------------------------
+
+/** One line per output file, for the multi-file Done screen. */
+data class DoneFileInfo(val file: File, val mimeType: String, val detail: String = "")
+
+fun formatSizeText(bytes: Long): String {
+  if (bytes <= 0) return "0 KB"
+  val kb = bytes / 1024.0
+  return if (kb >= 1024) String.format("%.1f MB", kb / 1024.0) else String.format("%.0f KB", kb)
+}
+
+fun displayNameOf(ctx: Context, uri: Uri): String? {
+  return try {
+    ctx.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+      ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+  } catch (_: Exception) { null }
+}
+
+fun baseNameOf(ctx: Context, uri: Uri, fallback: String): String {
+  val name = displayNameOf(ctx, uri) ?: return fallback
+  return name.substringBeforeLast(".", name).ifBlank { fallback }
+}
+
+/** Draws the watermark on a COPY of [bmp] so the preview shows exactly
+ *  what the PDF gets. Centre = diagonal across the middle; bottom =
+ *  centred near the bottom edge. Opacity is 10-50 (%). */
+fun watermarkedPreview(bmp: Bitmap, text: String, opacityPct: Int, position: String): Bitmap {
+  if (text.isBlank()) return bmp
+  return try {
+    val out = bmp.copy(Bitmap.Config.ARGB_8888, true)
+    val c = Canvas(out)
+    val alpha = ((opacityPct.coerceIn(10, 50) / 100f) * 255).toInt()
+    val paint = Paint().apply {
+      color = AndroidColor.argb(alpha, 0, 0, 0)
+      textSize = (out.width / 12f).coerceAtLeast(24f)
+      typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+      textAlign = Paint.Align.CENTER
+    }
+    if (position == "bottom") {
+      c.drawText(text, out.width / 2f, out.height - out.height * 0.06f, paint)
+    } else {
+      c.save()
+      c.rotate(-30f, out.width / 2f, out.height / 2f)
+      c.drawText(text, out.width / 2f, out.height / 2f, paint)
+      c.restore()
+    }
+    out
+  } catch (_: Exception) { bmp }
+}
 
 // --- Local PDF helpers (Phase 6) ------------------------------------------
-// PdfEngine.imagesToPdfWithOptions / PdfProtector.unlockPdf / setPermissions
-// / PdfCompress.compressPdfImages do NOT exist in this project, so the
-// Phase 6 extras are implemented here with only verified APIs (PdfDocument,
-// PdfEngine, PdfCompress, PdfProtector.verifyPassword) — no new deps.
+// PdfProtector.unlockPdf / setPermissions DO exist in this project, so
+// Protect uses them. The RC4 helpers below stay only for
+// patchPdfPermissions (permission-bit patching on the app's own V1/R2
+// files) and the unlock fallback path.
 
-// Standard PDF padding string (PDF spec, Algorithm 3.2) — same bytes as
-// PdfProtector's private PADDING.
-private val PDF_PADDING = byteArrayOf(
+val PDF_PADDING = byteArrayOf(
   0x28.toByte(), 0xBF.toByte(), 0x4E.toByte(), 0x5E.toByte(), 0x4E.toByte(), 0x75.toByte(), 0x8A.toByte(), 0x41.toByte(),
   0x64.toByte(), 0x00.toByte(), 0x4E.toByte(), 0x56.toByte(), 0xFF.toByte(), 0xFA.toByte(), 0x01.toByte(), 0x08.toByte(),
   0x2E.toByte(), 0x2E.toByte(), 0x00.toByte(), 0xB6.toByte(), 0xD0.toByte(), 0x68.toByte(), 0x3E.toByte(), 0x80.toByte(),
   0x2F.toByte(), 0x0C.toByte(), 0xA9.toByte(), 0xFE.toByte(), 0x64.toByte(), 0x53.toByte(), 0x69.toByte(), 0x7A.toByte()
 )
 
-private fun rc4Crypt(key: ByteArray, data: ByteArray): ByteArray {
+fun rc4Crypt(key: ByteArray, data: ByteArray): ByteArray {
   val s = IntArray(256) { it }
   var j = 0
   for (i in 0 until 256) {
@@ -112,13 +191,13 @@ private fun rc4Crypt(key: ByteArray, data: ByteArray): ByteArray {
   return out
 }
 
-private fun pdfMd5(vararg parts: ByteArray): ByteArray {
+fun pdfMd5(vararg parts: ByteArray): ByteArray {
   val d = MessageDigest.getInstance("MD5")
   parts.forEach { d.update(it) }
   return d.digest()
 }
 
-private fun pdfPadPassword(pw: String): ByteArray {
+fun pdfPadPassword(pw: String): ByteArray {
   val raw = pw.toByteArray(Charsets.ISO_8859_1)
   val out = ByteArray(32)
   val n = minOf(raw.size, 32)
@@ -127,7 +206,7 @@ private fun pdfPadPassword(pw: String): ByteArray {
   return out
 }
 
-private fun pdfHexToBytes(hex: String): ByteArray {
+fun pdfHexToBytes(hex: String): ByteArray {
   val clean = hex.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
   val out = ByteArray(clean.length / 2)
   for (i in out.indices) {
@@ -136,97 +215,16 @@ private fun pdfHexToBytes(hex: String): ByteArray {
   return out
 }
 
-private fun pdfBytesToHex(b: ByteArray): String {
+fun pdfBytesToHex(b: ByteArray): String {
   val sb = StringBuilder()
   b.forEach { sb.append(String.format("%02x", it.toInt() and 0xFF)) }
   return sb.toString()
 }
 
-// Images -> PDF with the Phase 6 options, drawn with plain PdfDocument
-// (no new dependency): page size A4 / Letter / Original (page sized to the
-// image's own aspect), optional page numbers, optional watermark text,
-// image quality via JPEG re-encode (High 92 / Medium 80 / Low 65).
-private fun buildImagesPdfWithOptions(
-  ctx: Context,
-  pages: List<PageItem>,
-  outFile: File,
-  pageSize: String,
-  pageNumbers: Boolean,
-  watermark: String,
-  quality: Int
-): Boolean {
-  if (pages.isEmpty()) return false
-  return try {
-    val doc = PdfDocument()
-    val (stdW, stdH) = when (pageSize) {
-      "Letter" -> 612 to 792
-      else -> 595 to 842 // A4 (and the cap used for Original)
-    }
-    var pageNo = 1
-    pages.forEach { page ->
-      var bmp = page.bitmap
-      try {
-        val baos = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(10, 100), baos)
-        val decoded = BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size())
-        if (decoded != null) bmp = decoded
-      } catch (_: Exception) { }
-      val (pageW, pageH) = if (pageSize == "Original") {
-        val scale = minOf(595f / bmp.width, 842f / bmp.height)
-        (bmp.width * scale).toInt().coerceAtLeast(100) to (bmp.height * scale).toInt().coerceAtLeast(100)
-      } else {
-        stdW to stdH
-      }
-      val info = PdfDocument.PageInfo.Builder(pageW, pageH, pageNo).create()
-      val pg = doc.startPage(info)
-      val c = pg.canvas
-      c.drawColor(AndroidColor.WHITE)
-      val scale = minOf((pageW - 72f) / bmp.width, (pageH - 72f) / bmp.height)
-      val w = bmp.width * scale
-      val h = bmp.height * scale
-      val dst = RectF((pageW - w) / 2, (pageH - h) / 2, (pageW + w) / 2, (pageH + h) / 2)
-      c.drawBitmap(bmp, null, dst, null)
-      if (watermark.isNotBlank()) {
-        val wp = Paint().apply {
-          color = AndroidColor.argb(60, 0, 0, 0)
-          textSize = 36f
-          typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-          textAlign = Paint.Align.CENTER
-        }
-        c.save()
-        c.rotate(-30f, pageW / 2f, pageH / 2f)
-        c.drawText(watermark, pageW / 2f, pageH / 2f, wp)
-        c.restore()
-      }
-      if (pageNumbers) {
-        val np = Paint().apply {
-          color = AndroidColor.DKGRAY
-          textSize = 12f
-          textAlign = Paint.Align.CENTER
-        }
-        c.drawText("$pageNo", pageW / 2f, pageH - 18f, np)
-      }
-      doc.finishPage(pg)
-      if (bmp !== page.bitmap) bmp.recycle()
-      pageNo++
-    }
-    FileOutputStream(outFile).use { doc.writeTo(it) }
-    doc.close()
-    true
-  } catch (e: Exception) {
-    e.printStackTrace()
-    false
-  }
-}
-
 // Unlock a Standard-security V1/R2 (RC4) PDF — the format this app's own
-// PdfProtector writes. RC4 is a stream cipher, so every encrypted stream
-// decrypts in place at exactly the same length: no object offsets change,
-// the xref table stays valid, and we only blank out the "/Encrypt N 0 R"
-// reference in the trailer. The password is verified first (U entry must
-// match) so a wrong password never produces a corrupt file. Returns false
-// for files this cannot decrypt (e.g. AES / R5+ / other encrypt handlers).
-private fun unlockProtectedPdf(input: File, password: String, out: File): Boolean {
+// PdfProtector writes. Returns false for files this cannot decrypt
+// (e.g. AES / R5+ / other encrypt handlers).
+fun unlockProtectedPdf(input: File, password: String, out: File): Boolean {
   return try {
     val bytes = input.readBytes()
     val text = String(bytes, Charsets.ISO_8859_1)
@@ -282,21 +280,24 @@ private fun unlockProtectedPdf(input: File, password: String, out: File): Boolea
   }
 }
 
-// Apply print/copy permissions to a PDF this app just protected.
-// PdfProtector hardcodes /P -4 (everything allowed), so the permission bits
-// are patched in place: /P and /U are recomputed consistently, and the /P
-// swap is length-preserving ("/P -4 >>" -> "/P -8 >>" / "/P -20>>" /
-// "/P -24>>") so the xref offsets stay valid. Returns false if the patch
+// Apply print/copy/edit permissions to a PDF this app just protected.
+// PdfProtector hardcodes /P -4 (everything allowed), so the permission
+// bits are patched in place: /P and /U are recomputed consistently, and
+// the /P swap is length-preserving (all replacements are 8 chars, same
+// as "/P -4 >>") so the xref offsets stay valid. P bits: print -4,
+// edit -8, copy -16 (from the -4 base). Returns false if the patch
 // could not be applied — the file is then left as the plain protected PDF.
-private fun patchPdfPermissions(
+fun patchPdfPermissions(
   file: File,
   password: String,
   allowPrint: Boolean,
-  allowCopy: Boolean
+  allowCopy: Boolean,
+  allowEdit: Boolean = true
 ): Boolean {
   return try {
     var pVal = -4
     if (!allowPrint) pVal -= 4
+    if (!allowEdit) pVal -= 8
     if (!allowCopy) pVal -= 16
     if (pVal == -4) return true
     val text = String(file.readBytes(), Charsets.ISO_8859_1)
@@ -314,8 +315,12 @@ private fun patchPdfPermissions(
     var outText = text.replace(uMatch.value, "/U <$newU>")
     val pReplacement = when (pVal) {
       -8 -> "/P -8 >>"
+      -12 -> "/P -12>>"
+      -16 -> "/P -16>>"
       -20 -> "/P -20>>"
       -24 -> "/P -24>>"
+      -28 -> "/P -28>>"
+      -32 -> "/P -32>>"
       else -> return false
     }
     if (!outText.contains("/P -4 >>")) return false
@@ -327,19 +332,67 @@ private fun patchPdfPermissions(
   }
 }
 
-// Compress-PDF quality slider (0-100) mapped onto the existing
-// PdfCompress presets. NOTE: PdfCompress re-renders every page as an image,
-// so text in the output is rasterised, not kept as selectable text —
-// PdfCompress.compressPdfImages (re-encode only the images, keep text)
-// does not exist in this project.
-private fun compressPdfWithQuality(ctx: Context, uri: Uri, quality: Int, out: File): PdfCompressResult {
-  val preset = when {
-    quality >= 70 -> PdfCompress.PRESETS[0] // High: 1.0x, q70
-    quality >= 40 -> PdfCompress.PRESETS[1] // Medium: 0.75x, q50
-    else -> PdfCompress.PRESETS[2] // Low: 0.6x, q40
+// PDF compress quality slider (10-100) with the exact quality, via the
+// engine's compressPdfImages (scale 1.0, exact JPEG quality). NOTE: the
+// engine re-renders every page as an image, so text in the output is
+// rasterised, not kept as selectable text — the UI must not claim
+// otherwise. Input is a Uri here, so it is copied to a temp file first.
+fun compressPdfWithQuality(ctx: Context, uri: Uri, quality: Int, out: File): PdfCompressResult {
+  return try {
+    val tmp = File(ctx.cacheDir, "compress_in_${System.currentTimeMillis()}.pdf")
+    ctx.contentResolver.openInputStream(uri)?.use { input -> FileOutputStream(tmp).use { o -> input.copyTo(o) } }
+    if (!tmp.exists()) return PdfCompressResult(false, 0, false, 0)
+    val ok = PdfEngine.compressPdfImages(ctx, tmp, out, quality.coerceIn(10, 100))
+    val outKb = if (ok && out.exists()) out.length() / 1024L else 0L
+    PdfCompressResult(ok, outKb, false, PdfEngine.pageCount(ctx, uri))
+  } catch (_: Exception) {
+    PdfCompressResult(false, 0, false, 0)
   }
-  return PdfCompress.compressPdf(ctx, uri, preset, out)
 }
+
+// --- ViewModel: pages + per-page filter state survive rotation ---------
+// Selection follows the page Uri, so reorder can never desync the
+// preview from the strip. Filter mode is stored per page Uri, so
+// switching pages never resets a filter.
+class PagesViewModel : ViewModel() {
+  var pages by mutableStateOf<List<PageItem>>(emptyList())
+  var selectedUri by mutableStateOf<Uri?>(null)
+  val filterModes = mutableStateMapOf<Uri, Int>()
+  val filterOriginals = mutableStateMapOf<Uri, Bitmap>()
+
+  val selectedIndex: Int
+    get() = pages.indexOfFirst { it.uri == selectedUri }.takeIf { it >= 0 } ?: 0
+
+  fun select(index: Int) {
+    selectedUri = pages.getOrNull(index)?.uri
+  }
+
+  fun setPages(list: List<PageItem>, selectFirstNew: Int? = null) {
+    pages = list
+    if (selectFirstNew != null) selectedUri = list.getOrNull(selectFirstNew)?.uri
+    else if (selectedUri != null && list.none { it.uri == selectedUri }) {
+      selectedUri = list.getOrNull(selectedIndex.coerceIn(0, (list.size - 1).coerceAtLeast(0)))?.uri
+    }
+  }
+
+  fun movePage(from: Int, to: Int) {
+    if (from !in pages.indices || to !in pages.indices) return
+    pages = ImagePageEditor.move(pages, from, to)
+    // selectedUri is unchanged, so selectedIndex follows the moved page.
+  }
+
+  /** Removes the page at [index]. The Uri is looked up BEFORE the list
+   *  is filtered, so the filter maps lose the right entry. */
+  fun deleteAt(index: Int) {
+    val uri = pages.getOrNull(index)?.uri ?: return
+    filterModes.remove(uri)
+    filterOriginals.remove(uri)
+    pages = pages.filterIndexed { i, _ -> i != index }
+    if (selectedUri == uri) selectedUri = pages.getOrNull((index - 1).coerceAtLeast(0))?.uri
+  }
+}
+
+// --- Shared UI -----------------------------------------------------------
 
 @Composable
 fun ToolScreenContainer(
@@ -354,9 +407,7 @@ fun ToolScreenContainer(
 
   fun vibrate() {
     if (tm.hapticOn()) {
-      try {
-        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-      } catch (_: Exception) {}
+      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
     }
   }
 
@@ -370,53 +421,21 @@ fun ToolScreenContainer(
       .fillMaxSize()
       .background(theme.bg)
       .statusBarsPadding()
-      .padding(16.dp)
+      .padding(Ds.s16)
   ) {
     Row(
       Modifier.fillMaxWidth(),
       verticalAlignment = Alignment.CenterVertically
     ) {
-      OutlinedButton(
-        onClick = {
-          vibrate()
-          onBack()
-        },
-        shape = RoundedCornerShape(10.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-        colors = ButtonDefaults.outlinedButtonColors(
-          containerColor = theme.card,
-          contentColor = theme.text
-        ),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-      ) {
-        Text("← BACK", color = theme.text, fontFamily = PixelFont, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-      }
-      Spacer(Modifier.width(12.dp))
-      Text(
-        text = title,
-        fontFamily = PixelFont,
-        fontWeight = FontWeight.ExtraBold,
-        fontSize = 18.sp,
-        color = theme.text,
-        maxLines = 1,
-        modifier = Modifier.weight(1f)
+      ChamiIconButton(
+        icon = Icons.Filled.ArrowBack,
+        description = "Back",
+        onClick = { vibrate(); onBack() }
       )
-      Box(
-        Modifier
-          .clip(RoundedCornerShape(6.dp))
-          .background(theme.primary.copy(alpha = 0.12f))
-          .padding(horizontal = 8.dp, vertical = 3.dp)
-      ) {
-        Text(
-          "OFFLINE",
-          fontFamily = PixelFont,
-          fontWeight = FontWeight.Bold,
-          fontSize = 10.sp,
-          color = theme.primary
-        )
-      }
+      Spacer(Modifier.width(Ds.s8))
+      TitleText(title, color = theme.text)
     }
-    Spacer(Modifier.height(14.dp))
+    Spacer(Modifier.height(Ds.s16))
     content()
   }
 }
@@ -428,7 +447,7 @@ fun PrimaryButton(
   onClick: () -> Unit,
   modifier: Modifier = Modifier,
   enabled: Boolean = true,
-  height: Dp = 56.dp
+  height: Dp = Ds.primaryButtonHeight
 ) {
   Button(
     onClick = onClick,
@@ -440,184 +459,270 @@ fun PrimaryButton(
       disabledContainerColor = theme.cardBorder,
       disabledContentColor = theme.textSecondary
     ),
-    shape = RoundedCornerShape(8.dp)
+    shape = RoundedCornerShape(Ds.buttonRadius)
   ) {
-    Text(text, fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+    Text(text, color = theme.textOnPrimary, fontSize = Ds.BUTTON_SP.sp, fontWeight = FontWeight.SemiBold)
   }
 }
 
+/** Text field whose value only propagates after the user stops typing
+ *  for 300ms, so typing does not recompose the whole scrolling column
+ *  and the 340dp preview on every keystroke. */
 @Composable
-fun ResultCard(file: File, theme: ChamiTheme, mimeType: String = "application/pdf") {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try {
-        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-      } catch (_: Exception) {}
+fun DebouncedTextField(
+  value: String,
+  onValueChange: (String) -> Unit,
+  label: String,
+  modifier: Modifier = Modifier,
+  singleLine: Boolean = true,
+  keyboardType: KeyboardType = KeyboardType.Text,
+  isError: Boolean = false,
+  supportingText: String? = null
+) {
+  var draft by remember(value) { mutableStateOf(value) }
+  LaunchedEffect(draft) {
+    delay(300)
+    if (draft != value) onValueChange(draft)
+  }
+  Column(modifier) {
+    OutlinedTextField(
+      value = draft,
+      onValueChange = { draft = it },
+      label = { Text(label, fontSize = Ds.HINT_SP.sp) },
+      singleLine = singleLine,
+      isError = isError,
+      keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+      modifier = Modifier.fillMaxWidth(),
+      shape = RoundedCornerShape(Ds.buttonRadius)
+    )
+    if (supportingText != null) {
+      Spacer(Modifier.height(Ds.s4))
+      Text(supportingText, fontSize = Ds.HINT_SP.sp, color = if (isError) ChamiColors.errorRed else ChamiColors.secondaryText)
     }
   }
+}
 
+/** Save-every-output flow: asks the folder ONCE (system folder picker),
+ *  writes every file there, then reports the saved files. */
+@Composable
+fun rememberFolderSaver(
+  onSaved: (List<File>) -> Unit,
+  onCancelled: () -> Unit
+): (List<Pair<File, String>>) -> Unit {
+  val ctx = LocalContext.current
+  val scope = rememberCoroutineScope()
+  var pending by remember { mutableStateOf<List<Pair<File, String>>?>(null) }
+  val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+    val files = pending
+    pending = null
+    if (treeUri == null || files == null) {
+      if (files != null) onCancelled()
+      return@rememberLauncherForActivityResult
+    }
+    scope.launch(Dispatchers.IO) {
+      try {
+        ctx.contentResolver.takePersistableUriPermission(
+          treeUri,
+          Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        )
+      } catch (_: Exception) {}
+      val saved = mutableListOf<File>()
+      for ((file, mime) in files) {
+        try {
+          val docUri = DocumentsContract.createDocument(ctx.contentResolver, treeUri, mime, file.name)
+          if (docUri != null && SaveLocation.copyToUri(ctx, file, docUri)) saved.add(file)
+        } catch (_: Exception) {}
+      }
+      withContext(Dispatchers.Main) {
+        if (saved.isNotEmpty()) onSaved(saved) else onCancelled()
+      }
+    }
+  }
+  return { files ->
+    pending = files
+    launcher.launch(null)
+  }
+}
+
+/** Single-file save flow shared by the one-output tools: build -> save
+ *  picker opens directly -> DoneScreen. Returns the launcher trigger. */
+@Composable
+fun rememberSingleFileSaver(
+  onSaved: (File) -> Unit
+): (File) -> Unit {
+  val ctx = LocalContext.current
+  val scope = rememberCoroutineScope()
+  var pending by remember { mutableStateOf<File?>(null) }
+  val launcher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
+    val file = pending
+    pending = null
+    if (uri != null && file != null) {
+      scope.launch {
+        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
+        if (ok) onSaved(file)
+        else Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
+      }
+    } else if (uri == null && file != null) {
+      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
+    }
+  }
+  return { file ->
+    pending = file
+    launcher.launch(file.name)
+  }
+}
+
+/** Done screen for multi-file results: tick, count, per-file list. */
+@Composable
+fun MultiDoneScreen(
+  files: List<DoneFileInfo>,
+  title: String,
+  summaryLines: List<String>,
+  theme: ChamiTheme,
+  onBackHome: () -> Unit,
+  onOpen: (File) -> Unit
+) {
+  val ctx = LocalContext.current
   Column(
     Modifier
-      .fillMaxWidth()
-      .clip(RoundedCornerShape(16.dp))
-      .background(theme.card)
-      .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-      .padding(16.dp)
+      .fillMaxSize()
+      .background(theme.bg)
+      .statusBarsPadding()
+      .padding(Ds.s16)
+      .verticalScroll(rememberScrollState()),
+    horizontalAlignment = Alignment.CenterHorizontally
   ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-      Box(
-        Modifier
-          .size(36.dp)
-          .clip(CircleShape)
-          .background(theme.primary.copy(alpha = 0.15f)),
-        contentAlignment = Alignment.Center
-      ) {
-        Text("✓", color = theme.primary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-      }
-      Spacer(Modifier.width(10.dp))
-      Column {
-        Text("Document Ready", fontFamily = PixelFont, fontWeight = FontWeight.Bold, color = theme.text, fontSize = 15.sp)
-        Text("Saved to internal device storage", fontFamily = PixelFont, color = theme.textSecondary, fontSize = 11.sp)
-      }
-    }
-    Spacer(Modifier.height(10.dp))
+    Spacer(Modifier.height(Ds.s24))
     Box(
-      Modifier
-        .fillMaxWidth()
-        .clip(RoundedCornerShape(10.dp))
-        .background(theme.bg)
-        .border(1.dp, theme.cardBorder, RoundedCornerShape(10.dp))
-        .padding(10.dp)
+      Modifier.size(72.dp).clip(CircleShape).background(ChamiColors.lightGreen),
+      contentAlignment = Alignment.Center
     ) {
-      Column {
-        Text(file.name, fontFamily = PixelFont, fontWeight = FontWeight.SemiBold, color = theme.text, fontSize = 12.sp, maxLines = 1)
-        Spacer(Modifier.height(2.dp))
-        Text("${file.length() / 1024} KB • Location: /Chami/${file.name}", fontFamily = PixelFont, color = theme.textSecondary, fontSize = 11.sp)
+      Icon(Icons.Filled.Check, contentDescription = "Done", tint = ChamiColors.darkGreen, modifier = Modifier.size(36.dp))
+    }
+    Spacer(Modifier.height(Ds.s16))
+    TitleText(title, color = theme.text)
+    Spacer(Modifier.height(Ds.s8))
+    summaryLines.forEach { line ->
+      Text(line, fontSize = Ds.BODY_SP.sp, color = theme.text, lineHeight = (Ds.BODY_SP * 1.4).sp)
+      Spacer(Modifier.height(Ds.s4))
+    }
+    Spacer(Modifier.height(Ds.s16))
+    Column(verticalArrangement = Arrangement.spacedBy(Ds.s8), modifier = Modifier.fillMaxWidth()) {
+      files.forEach { info ->
+        Row(
+          Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(Ds.tileRadius))
+            .background(theme.card)
+            .border(1.dp, theme.cardBorder, RoundedCornerShape(Ds.tileRadius))
+            .padding(Ds.s12),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Icon(
+            if (info.mimeType.startsWith("image/")) Icons.Filled.Image else Icons.Filled.PictureAsPdf,
+            contentDescription = null, tint = ChamiColors.darkGreen, modifier = Modifier.size(24.dp)
+          )
+          Spacer(Modifier.width(Ds.s12))
+          Column(Modifier.weight(1f)) {
+            Text(info.file.name, fontSize = Ds.BODY_SP.sp, fontWeight = FontWeight.SemiBold, color = theme.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (info.detail.isNotBlank()) {
+              Text(info.detail, fontSize = Ds.HINT_SP.sp, color = theme.textSecondary)
+            }
+          }
+        }
       }
     }
-    Spacer(Modifier.height(14.dp))
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      Button(
-        onClick = {
-          vibrate()
-          ShareHelper.openFile(ctx, file, mimeType)
-        },
-        modifier = Modifier.weight(1f).height(44.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-        shape = RoundedCornerShape(10.dp)
-      ) {
-        Text("OPEN FILE", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-      }
-      OutlinedButton(
-        onClick = {
-          vibrate()
-          ShareHelper.shareFile(ctx, file, mimeType)
-        },
-        modifier = Modifier.weight(1f).height(44.dp),
-        shape = RoundedCornerShape(10.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-      ) {
-        Text("SHARE", fontFamily = PixelFont, color = theme.text, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-      }
-    }
-  }
-}
-
-// --- Phase 6 shared pieces (used by Images to PDF + Scan to PDF) ---------
-// NOTE: the "new PageList overload" from the brief does not exist in
-// ImagePageEditor.kt (only the old 3-arg PageList, which still prints the
-// "PREVIEW (X PAGES):" / "Hold a page..." lines), so the Phase 6 page list
-// is implemented here instead — same hold-to-drag reorder, tap to select,
-// big "+" tile — without depending on another file changing.
-
-@Composable
-private fun Phase6Chip(label: String, selected: Boolean, theme: ChamiTheme, onClick: () -> Unit) {
-  Box(
-    Modifier
-      .clip(RoundedCornerShape(16.dp))
-      .background(if (selected) theme.primary else theme.card)
-      .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-      .clickable { onClick() }
-      .padding(horizontal = 12.dp, vertical = 8.dp),
-    contentAlignment = Alignment.Center
-  ) {
-    Text(
-      if (selected) "✓ $label" else label,
-      fontFamily = PixelFont,
-      fontSize = 11.sp,
-      fontWeight = FontWeight.Bold,
-      color = if (selected) theme.textOnPrimary else theme.text
+    Spacer(Modifier.height(Ds.s24))
+    ChamiPrimaryButton(
+      text = "Open first file",
+      onClick = { files.firstOrNull()?.let { onOpen(it.file) } },
+      modifier = Modifier.fillMaxWidth()
     )
+    Spacer(Modifier.height(Ds.s12))
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+      ChamiSecondaryButton(
+        text = "Share first file",
+        onClick = { files.firstOrNull()?.let { ShareHelper.shareFile(ctx, it.file, it.mimeType) } },
+        modifier = Modifier.weight(1f)
+      )
+      ChamiSecondaryButton(text = "Done", onClick = onBackHome, modifier = Modifier.weight(1f))
+    }
+    Spacer(Modifier.height(Ds.s16))
   }
 }
 
 // Big main preview (340dp, full width) with the left-corner vertical icon
-// stack: Crop on top, then Delete, then Filter, then Adjust.
+// stack: Crop on top, then Straighten, Delete, Filter, Adjust. Each is a
+// 48dp PreviewActionButton with a real vector icon. [watermarkedBitmap]
+// is the preview with the live watermark already drawn on it, when one
+// is set; [pageNumber] draws a real page number at the chosen position.
 @Composable
-private fun BigPagePreview(
+fun BigPagePreview(
   page: PageItem?,
   label: String,
   theme: ChamiTheme,
   onCrop: () -> Unit,
+  onStraighten: () -> Unit,
   onDelete: () -> Unit,
   onFilter: () -> Unit,
   onAdjust: () -> Unit,
-  height: Dp = 340.dp
+  height: Dp = 340.dp,
+  watermarkedBitmap: Bitmap? = null,
+  pageNumber: Int? = null,
+  pageNumberPosition: String = "centre"
 ) {
   Box(
     Modifier
       .fillMaxWidth()
       .height(height)
-      .clip(RoundedCornerShape(8.dp))
+      .clip(RoundedCornerShape(Ds.s8))
       .background(theme.card)
-      .border(1.dp, theme.cardBorder, RoundedCornerShape(8.dp))
+      .border(1.dp, theme.cardBorder, RoundedCornerShape(Ds.s8))
   ) {
-    if (page != null) {
+    val shown = watermarkedBitmap ?: page?.bitmap
+    if (shown != null) {
       Image(
-        bitmap = page.bitmap.asImageBitmap(),
+        bitmap = shown.asImageBitmap(),
         contentDescription = label,
-        modifier = Modifier.fillMaxSize().padding(4.dp),
+        modifier = Modifier.fillMaxSize().padding(Ds.s4),
         contentScale = ContentScale.Fit
       )
     } else {
       Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text("No page yet", fontFamily = PixelFont, fontSize = 12.sp, color = theme.textSecondary)
+        Text("No page yet", fontSize = Ds.HINT_SP.sp, color = theme.textSecondary)
       }
     }
+    if (pageNumber != null) {
+      Text(
+        "$pageNumber",
+        fontSize = Ds.HINT_SP.sp,
+        color = theme.text,
+        modifier = Modifier
+          .align(if (pageNumberPosition == "right") Alignment.BottomEnd else Alignment.BottomCenter)
+          .padding(Ds.s8)
+          .background(Color.White.copy(alpha = 0.7f), RoundedCornerShape(Ds.s4))
+          .padding(horizontal = Ds.s8, vertical = Ds.s4)
+      )
+    }
     Column(
-      Modifier.align(Alignment.TopStart).padding(8.dp),
-      verticalArrangement = Arrangement.spacedBy(8.dp)
+      Modifier.align(Alignment.TopStart).padding(Ds.s8),
+      verticalArrangement = Arrangement.spacedBy(Ds.s8)
     ) {
-      listOf(
-        "◫" to onCrop,
-        "✕" to onDelete,
-        "✦" to onFilter,
-        "◐" to onAdjust
-      ).forEach { (glyph, action) ->
-        Box(
-          Modifier
-            .size(40.dp)
-            .clip(CircleShape)
-            .background(theme.primary)
-            .clickable { action() },
-          contentAlignment = Alignment.Center
-        ) {
-          Text(glyph, color = theme.textOnPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-        }
-      }
+      PreviewActionButton(Icons.Filled.Crop, "Crop — cut the image", onCrop)
+      PreviewActionButton(Icons.Filled.Straighten, "Straighten — fix perspective", onStraighten)
+      PreviewActionButton(Icons.Filled.Delete, "Delete this page", onDelete)
+      PreviewActionButton(Icons.Filled.Filter, "Filter", onFilter)
+      PreviewActionButton(Icons.Filled.Tune, "Adjust brightness", onAdjust)
     }
   }
 }
 
-// Thumbnail strip: tap a thumbnail to change the big preview, hold a
-// thumbnail and drag it left/right to reorder, big "+" tile at the end.
+// Thumbnail strip: 72dp thumbnails, 8dp gaps, selected thumbnail has a
+// 2dp dark-green outline. Tap a thumbnail to change the big preview,
+// hold and drag to reorder (drop at half a card width), big "+" tile
+// after the last thumbnail.
 @Composable
-private fun PageThumbnailStrip(
+fun PageThumbnailStrip(
   pages: List<PageItem>,
   selectedIndex: Int,
   theme: ChamiTheme,
@@ -629,20 +734,16 @@ private fun PageThumbnailStrip(
   val haptic = LocalHapticFeedback.current
   val scope = rememberCoroutineScope()
   val listState = rememberLazyListState()
-  // Drag state lives at strip level (not per item): the gesture must
-  // survive a reorder, which changes the dragged item's index (H8).
-  // latestPages/latestOnMove always see the current list inside the
-  // long-running pointerInput block (keyed on page.uri).
   val latestPages by rememberUpdatedState(pages)
   val latestOnMove by rememberUpdatedState(onMove)
   var draggingUri by remember { mutableStateOf<Uri?>(null) }
   var dragOffsetX by remember { mutableStateOf(0f) }
-  val cardPx = with(density) { 96.dp.toPx() }
-  val gapPx = with(density) { 10.dp.toPx() }
+  val cardPx = with(density) { Ds.thumbStripHeight.toPx() }
+  val gapPx = with(density) { Ds.s8.toPx() }
   val cardFullPx = cardPx + gapPx
   LazyRow(
     state = listState,
-    horizontalArrangement = Arrangement.spacedBy(10.dp),
+    horizontalArrangement = Arrangement.spacedBy(Ds.s8),
     modifier = Modifier.fillMaxWidth()
   ) {
     itemsIndexed(pages, key = { _, page -> page.uri.toString() }) { index, page ->
@@ -651,13 +752,13 @@ private fun PageThumbnailStrip(
       Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
           Modifier
-            .size(96.dp)
+            .size(Ds.thumbStripHeight)
             .graphicsLayer {
               translationX = if (isDragging) dragOffsetX else 0f
               scaleX = if (isDragging) 1.08f else 1f
               scaleY = if (isDragging) 1.08f else 1f
               shadowElevation = if (isDragging) 12f else 0f
-              shape = RoundedCornerShape(8.dp)
+              shape = RoundedCornerShape(Ds.s8)
               clip = true
             }
             .pointerInput(page.uri) {
@@ -670,8 +771,6 @@ private fun PageThumbnailStrip(
                 onDrag = { change, dragAmount ->
                   change.consume()
                   dragOffsetX += dragAmount.x
-                  // Live reorder at half a card width, using the dragged
-                  // page's CURRENT index (not the stale captured one).
                   val cur = latestPages.indexOfFirst { it.uri == page.uri }
                   if (cur < 0) return@detectDragGesturesAfterLongPress
                   val halfPx = cardFullPx / 2f
@@ -682,7 +781,6 @@ private fun PageThumbnailStrip(
                     latestOnMove(cur, cur - 1)
                     dragOffsetX += cardFullPx
                   }
-                  // Auto-scroll at the strip edges while dragging.
                   if (dragOffsetX > cardFullPx * 0.7f) scope.launch { listState.scrollBy(cardFullPx * 0.3f) }
                   else if (dragOffsetX < -cardFullPx * 0.7f) scope.launch { listState.scrollBy(-cardFullPx * 0.3f) }
                 },
@@ -695,7 +793,7 @@ private fun PageThumbnailStrip(
               )
             }
             .background(theme.card)
-            .border(2.dp, if (isSel) theme.primary else theme.cardBorder, RoundedCornerShape(8.dp))
+            .border(2.dp, if (isSel) ChamiColors.darkGreen else theme.cardBorder, RoundedCornerShape(Ds.s8))
             .clickable { onSelect(index) }
         ) {
           Image(
@@ -708,20 +806,19 @@ private fun PageThumbnailStrip(
             Box(
               Modifier
                 .align(Alignment.TopEnd)
-                .size(20.dp)
+                .size(24.dp)
                 .clip(CircleShape)
-                .background(theme.primary),
+                .background(ChamiColors.darkGreen),
               contentAlignment = Alignment.Center
             ) {
-              Text("✓", color = theme.textOnPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+              Icon(Icons.Filled.Check, contentDescription = "Selected", tint = Color.White, modifier = Modifier.size(16.dp))
             }
           }
         }
-        Spacer(Modifier.height(3.dp))
+        Spacer(Modifier.height(Ds.s4))
         Text(
           "Page ${index + 1}",
-          fontFamily = PixelFont,
-          fontSize = 10.sp,
+          fontSize = Ds.HINT_SP.sp,
           fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
           color = if (isSel) theme.primary else theme.text
         )
@@ -731,24 +828,24 @@ private fun PageThumbnailStrip(
       Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
           Modifier
-            .size(96.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .size(Ds.thumbStripHeight)
+            .clip(RoundedCornerShape(Ds.s8))
             .background(theme.card)
-            .border(2.dp, theme.primary, RoundedCornerShape(8.dp))
+            .border(2.dp, theme.primary, RoundedCornerShape(Ds.s8))
             .clickable { onAddPages() },
           contentAlignment = Alignment.Center
         ) {
-          Text("+", fontSize = 36.sp, fontWeight = FontWeight.Bold, color = theme.primary)
+          Icon(Icons.Filled.Add, contentDescription = "Add pages", tint = theme.primary, modifier = Modifier.size(24.dp))
         }
-        Spacer(Modifier.height(3.dp))
-        Text("Add", fontFamily = PixelFont, fontSize = 10.sp, color = theme.text)
+        Spacer(Modifier.height(Ds.s4))
+        Text("Add", fontSize = Ds.HINT_SP.sp, color = theme.text)
       }
     }
   }
 }
 
 @Composable
-private fun FilterPickerDialog(
+fun FilterPickerDialog(
   selected: Int,
   theme: ChamiTheme,
   onPick: (Int) -> Unit,
@@ -757,34 +854,33 @@ private fun FilterPickerDialog(
   val names = listOf("Original", "B&W", "Grayscale", "Enhance")
   AlertDialog(
     onDismissRequest = onDismiss,
-    title = {
-      Text("FILTER", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = theme.text)
-    },
+    title = { Text("Filter", fontSize = Ds.SECTION_SP.sp, fontWeight = FontWeight.Bold, color = theme.text) },
     text = {
-      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+      Column(verticalArrangement = Arrangement.spacedBy(Ds.s8)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
           names.take(2).forEachIndexed { i, n ->
-            Phase6Chip(n, selected == i, theme) { onPick(i) }
+            ChamiChip(n, selected == i, { onPick(i) }, Modifier.weight(1f))
           }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
           names.drop(2).forEachIndexed { k, n ->
             val i = k + 2
-            Phase6Chip(n, selected == i, theme) { onPick(i) }
+            ChamiChip(n, selected == i, { onPick(i) }, Modifier.weight(1f))
           }
         }
+        HintText("Filter applies to this page only.")
       }
     },
     confirmButton = {
       TextButton(onClick = onDismiss) {
-        Text("DONE", fontFamily = PixelFont, color = theme.primary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text("Done", color = theme.primary, fontSize = Ds.BUTTON_SP.sp, fontWeight = FontWeight.SemiBold)
       }
     }
   )
 }
 
 @Composable
-private fun BrightnessDialog(
+fun BrightnessDialog(
   value: Float,
   theme: ChamiTheme,
   onValueChange: (Float) -> Unit,
@@ -793,38 +889,31 @@ private fun BrightnessDialog(
 ) {
   AlertDialog(
     onDismissRequest = onDismiss,
-    title = {
-      Text("ADJUST BRIGHTNESS", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = theme.text)
-    },
+    title = { Text("Adjust brightness", fontSize = Ds.SECTION_SP.sp, fontWeight = FontWeight.Bold, color = theme.text) },
     text = {
       Column {
-        Text("Brightness: ${value.toInt()}", fontFamily = PixelFont, fontSize = 12.sp, color = theme.textSecondary)
+        Text("Brightness: ${value.toInt()}", fontSize = Ds.BODY_SP.sp, color = theme.textSecondary)
         Slider(
           value = value,
           onValueChange = onValueChange,
-          valueRange = -100f..100f,
+          valueRange = -50f..50f,
           colors = SliderDefaults.colors(thumbColor = theme.primary, activeTrackColor = theme.primary)
         )
       }
     },
     confirmButton = {
-      Button(
-        onClick = onApply,
-        colors = ButtonDefaults.buttonColors(containerColor = theme.primary)
-      ) {
-        Text("APPLY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+      Button(onClick = onApply, colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) {
+        Text("Apply", color = theme.textOnPrimary, fontSize = Ds.BUTTON_SP.sp, fontWeight = FontWeight.SemiBold)
       }
     },
     dismissButton = {
-      TextButton(onClick = onDismiss) {
-        Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-      }
+      TextButton(onClick = onDismiss) { Text("Cancel", color = theme.text) }
     }
   )
 }
 
 @Composable
-private fun AddPageSourceDialog(
+fun AddPageSourceDialog(
   theme: ChamiTheme,
   onCamera: () -> Unit,
   onGallery: () -> Unit,
@@ -832,106 +921,369 @@ private fun AddPageSourceDialog(
 ) {
   AlertDialog(
     onDismissRequest = onDismiss,
-    title = {
-      Text("ADD PAGE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = theme.text)
-    },
+    title = { Text("Add page", fontSize = Ds.SECTION_SP.sp, fontWeight = FontWeight.Bold, color = theme.text) },
     text = {
-      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(
-          onClick = onCamera,
-          modifier = Modifier.fillMaxWidth().height(48.dp),
-          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-          shape = RoundedCornerShape(8.dp)
-        ) {
-          Text("📷 CAMERA", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        }
-        OutlinedButton(
-          onClick = onGallery,
-          modifier = Modifier.fillMaxWidth().height(48.dp),
-          shape = RoundedCornerShape(8.dp),
-          border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-          colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-        ) {
-          Text("🖼️ GALLERY", fontFamily = PixelFont, color = theme.text, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        }
+      Column(verticalArrangement = Arrangement.spacedBy(Ds.s8)) {
+        ChamiPrimaryButton(text = "Camera", onClick = onCamera, modifier = Modifier.fillMaxWidth())
+        ChamiSecondaryButton(text = "Gallery", onClick = onGallery, modifier = Modifier.fillMaxWidth())
       }
     },
     confirmButton = {
-      TextButton(onClick = onDismiss) {
-        Text("CANCEL", fontFamily = PixelFont, color = theme.text)
-      }
+      TextButton(onClick = onDismiss) { Text("Cancel", color = theme.text) }
     }
   )
 }
 
-// 1. IMAGES TO PDF — Phase 6 redesign:
-// - Top line is ONLY "Select photos from gallery".
-// - Big preview (340dp) shows the SELECTED page; tapping a thumbnail
-//   changes it. Left-corner icon stack: Crop / Delete / Filter / Adjust.
-// - CHOOSE IMAGES button only when no pages are selected; after that the
-//   big "+" tile in the thumbnail strip adds more.
-// - No "PREVIEW (X PAGES):" / hold-to-drag hint lines.
-// - Extras: page size A4/Letter/Original, page numbers, watermark,
-//   image quality — wired into the build via buildImagesPdfWithOptions.
-// - Slide to Convert (haptic on complete). After the slide the
-//   save-location picker opens directly, then DoneScreen.
+// --- Rectangular CUT crop dialog (default crop) ---------------------------
+// Crop CUTS: dragging a corner or edge removes everything outside the
+// frame. It never bends, warps or changes perspective — perspective
+// correction is the separate Straighten button, which opens
+// CropEditorDialog (cropToQuad) instead. Ratio presets: Free / Original /
+// 1:1 / 3:4 / 4:3 / 16:9 / A4. Apply calls ImagePageEditor.cropToRect.
+@Composable
+fun RectCropDialog(
+  bitmap: Bitmap,
+  theme: ChamiTheme,
+  onApply: (Bitmap) -> Unit,
+  onDismiss: () -> Unit,
+  onRotate: () -> Unit = {}
+) {
+  var rect by remember(bitmap) { mutableStateOf(ComposeRect(0f, 0f, 1f, 1f)) }
+  var ratioLabel by rememberSaveable { mutableStateOf("Free") }
+  val ratios = listOf(
+    "Free" to null as Float?,
+    "Original" to null,
+    "1:1" to 1f,
+    "3:4" to 0.75f,
+    "4:3" to (4f / 3f),
+    "16:9" to (16f / 9f),
+    "A4" to (1f / 1.414f)
+  )
+  fun ratioRect(ratio: Float?): ComposeRect {
+    if (ratio == null) return ComposeRect(0f, 0f, 1f, 1f)
+    val imgAspect = bitmap.width.toFloat() / bitmap.height
+    return if (ratio >= imgAspect) {
+      val h = imgAspect / ratio
+      ComposeRect(0f, (1f - h) / 2f, 1f, (1f + h) / 2f)
+    } else {
+      val w = ratio / imgAspect
+      ComposeRect((1f - w) / 2f, 0f, (1f + w) / 2f, 1f)
+    }
+  }
+  Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    Column(
+      Modifier.fillMaxSize().background(Color.Black).padding(Ds.s16)
+    ) {
+      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        TextButton(onClick = onDismiss, modifier = Modifier.height(Ds.minTouch)) {
+          Text("Cancel", color = Color.White, fontSize = Ds.BUTTON_SP.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Text("Crop — cuts the image", color = Color.White, fontSize = Ds.SECTION_SP.sp, fontWeight = FontWeight.Bold)
+        TextButton(
+          onClick = {
+            try {
+              val androidRect = Rect(rect.left, rect.top, rect.right, rect.bottom)
+              onApply(ImagePageEditor.cropToRect(bitmap, androidRect, 1f))
+            } catch (_: Exception) { onDismiss() }
+          },
+          modifier = Modifier.height(Ds.minTouch)
+        ) {
+          Text("Apply", color = ChamiColors.brightGreen, fontSize = Ds.BUTTON_SP.sp, fontWeight = FontWeight.SemiBold)
+        }
+      }
+      Spacer(Modifier.height(Ds.s8))
+      Text(
+        "Drag a corner or edge to cut. Everything outside the frame is removed. For tilted pages use Straighten instead.",
+        fontSize = Ds.HINT_SP.sp, color = Color(0xFFCBD5E1)
+      )
+      Spacer(Modifier.height(Ds.s8))
+      Row(
+        horizontalArrangement = Arrangement.spacedBy(Ds.s8),
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+      ) {
+        ratios.forEach { (label, ratio) ->
+          ChamiChip(label, ratioLabel == label, {
+            ratioLabel = label
+            rect = ratioRect(ratio)
+          })
+        }
+      }
+      Spacer(Modifier.height(Ds.s16))
+      BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+        val density = LocalDensity.current
+        val boxW = with(density) { maxWidth.toPx() }
+        val boxH = with(density) { maxHeight.toPx() }
+        val imgAspect = bitmap.width.toFloat() / bitmap.height
+        val dispW = if (boxW / boxH > imgAspect) boxH * imgAspect else boxW
+        val dispH = dispW / imgAspect
+        val offX = (boxW - dispW) / 2f
+        val offY = (boxH - dispH) / 2f
+        fun toPxX(f: Float) = offX + f * dispW
+        fun toPxY(f: Float) = offY + f * dispH
+        Box(Modifier.fillMaxSize()) {
+          Image(
+            bitmap = bitmap.asImageBitmap(), contentDescription = "Crop preview",
+            modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit
+          )
+          androidx.compose.foundation.Canvas(
+            Modifier.fillMaxSize()
+          ) {
+            val left = toPxX(rect.left); val top = toPxY(rect.top)
+            val right = toPxX(rect.right); val bottom = toPxY(rect.bottom)
+            drawRect(Color.Black.copy(alpha = 0.5f), topLeft = androidx.compose.ui.geometry.Offset(0f, 0f), size = androidx.compose.ui.geometry.Size(size.width, top))
+            drawRect(Color.Black.copy(alpha = 0.5f), topLeft = androidx.compose.ui.geometry.Offset(0f, bottom), size = androidx.compose.ui.geometry.Size(size.width, size.height - bottom))
+            drawRect(Color.Black.copy(alpha = 0.5f), topLeft = androidx.compose.ui.geometry.Offset(0f, top), size = androidx.compose.ui.geometry.Size(left, bottom - top))
+            drawRect(Color.Black.copy(alpha = 0.5f), topLeft = androidx.compose.ui.geometry.Offset(right, top), size = androidx.compose.ui.geometry.Size(size.width - right, bottom - top))
+            drawRect(
+              color = ChamiColors.brightGreen,
+              topLeft = androidx.compose.ui.geometry.Offset(left, top),
+              size = androidx.compose.ui.geometry.Size(right - left, bottom - top),
+              style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
+            )
+            val gw = (right - left) / 3f; val gh = (bottom - top) / 3f
+            for (i in 1..2) {
+              drawLine(ChamiColors.brightGreen.copy(alpha = 0.5f), androidx.compose.ui.geometry.Offset(left + gw * i, top), androidx.compose.ui.geometry.Offset(left + gw * i, bottom))
+              drawLine(ChamiColors.brightGreen.copy(alpha = 0.5f), androidx.compose.ui.geometry.Offset(left, top + gh * i), androidx.compose.ui.geometry.Offset(right, top + gh * i))
+            }
+          }
+          // 8 handles, 48dp touch targets: 4 corners + 4 edge midpoints.
+          val handles = listOf(
+            "tl" to androidx.compose.ui.geometry.Offset(rect.left, rect.top),
+            "tr" to androidx.compose.ui.geometry.Offset(rect.right, rect.top),
+            "bl" to androidx.compose.ui.geometry.Offset(rect.left, rect.bottom),
+            "br" to androidx.compose.ui.geometry.Offset(rect.right, rect.bottom),
+            "t" to androidx.compose.ui.geometry.Offset((rect.left + rect.right) / 2f, rect.top),
+            "b" to androidx.compose.ui.geometry.Offset((rect.left + rect.right) / 2f, rect.bottom),
+            "l" to androidx.compose.ui.geometry.Offset(rect.left, (rect.top + rect.bottom) / 2f),
+            "r" to androidx.compose.ui.geometry.Offset(rect.right, (rect.top + rect.bottom) / 2f)
+          )
+          // Keyed on the handle id ONLY: keying on rect would restart
+          // (and cancel) the drag on its first pixel, because dragging
+          // changes rect. The current rect is read via rememberUpdatedState.
+          val latestRect by rememberUpdatedState(rect)
+          handles.forEach { (id, frac) ->
+            Box(
+              Modifier
+                .offset(
+                  x = with(density) { (toPxX(frac.x) - 24.dp.toPx()).toDp() },
+                  y = with(density) { (toPxY(frac.y) - 24.dp.toPx()).toDp() }
+                )
+                .size(Ds.minTouch)
+                .pointerInput(id) {
+                  detectDragGestures { change, drag ->
+                    change.consume()
+                    val cur = latestRect
+                    val dx = drag.x / dispW
+                    val dy = drag.y / dispH
+                    val min = 0.05f
+                    rect = when (id) {
+                      "tl" -> ComposeRect((cur.left + dx).coerceIn(0f, cur.right - min), (cur.top + dy).coerceIn(0f, cur.bottom - min), cur.right, cur.bottom)
+                      "tr" -> ComposeRect(cur.left, (cur.top + dy).coerceIn(0f, cur.bottom - min), (cur.right + dx).coerceIn(cur.left + min, 1f), cur.bottom)
+                      "bl" -> ComposeRect((cur.left + dx).coerceIn(0f, cur.right - min), cur.top, cur.right, (cur.bottom + dy).coerceIn(cur.top + min, 1f))
+                      "br" -> ComposeRect(cur.left, cur.top, (cur.right + dx).coerceIn(cur.left + min, 1f), (cur.bottom + dy).coerceIn(cur.top + min, 1f))
+                      "t" -> ComposeRect(cur.left, (cur.top + dy).coerceIn(0f, cur.bottom - min), cur.right, cur.bottom)
+                      "b" -> ComposeRect(cur.left, cur.top, cur.right, (cur.bottom + dy).coerceIn(cur.top + min, 1f))
+                      "l" -> ComposeRect((cur.left + dx).coerceIn(0f, cur.right - min), cur.top, cur.right, cur.bottom)
+                      else -> ComposeRect(cur.left, cur.top, (cur.right + dx).coerceIn(cur.left + min, 1f), cur.bottom)
+                    }
+                  }
+                },
+              contentAlignment = Alignment.Center
+            ) {
+              Box(Modifier.size(20.dp).clip(CircleShape).background(Color.White).border(2.dp, ChamiColors.darkGreen, CircleShape))
+            }
+          }
+        }
+      }
+      Spacer(Modifier.height(Ds.s16))
+      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+        ChamiSecondaryButton(text = "Reset", onClick = { rect = ratioRect(ratios.first { it.first == ratioLabel }.second) }, modifier = Modifier.weight(1f))
+        ChamiSecondaryButton(text = "Rotate 90°", onClick = onRotate, modifier = Modifier.weight(1f))
+      }
+    }
+  }
+}
+
+// --- Shared page-editing helper (Images + Scan) ---------------------------
+class PageEditor(
+  private val ctx: Context,
+  private val scope: kotlinx.coroutines.CoroutineScope,
+  private val vm: PagesViewModel
+) {
+  private var busy = false
+
+  /** Replaces page [index] with [bmp], saving it to a temp file first so
+   *  the PDF uses the edited image. [newOriginal] becomes the filter
+   *  base stored under the new Uri (crop/rotate = new base). */
+  fun replacePage(index: Int, bmp: Bitmap, newOriginal: Bitmap? = bmp, onDone: () -> Unit = {}) {
+    val page = vm.pages.getOrNull(index) ?: return
+    if (busy) return
+    busy = true
+    scope.launch {
+      try {
+        val newUri = ImagePageEditor.bitmapToUri(ctx, bmp, "page_${index}_${System.currentTimeMillis()}.jpg")
+        val oldUri = page.uri
+        val wasSelected = vm.selectedUri == oldUri
+        val oldMode = vm.filterModes.remove(oldUri)
+        val updated = vm.pages.toMutableList()
+        if (index in updated.indices) updated[index] = PageItem(newUri, bmp, cropped = true)
+        vm.setPages(updated)
+        if (wasSelected) vm.selectedUri = newUri
+        if (oldMode != null) vm.filterModes[newUri] = oldMode
+        vm.filterOriginals.remove(oldUri)
+        if (newOriginal != null) vm.filterOriginals[newUri] = newOriginal
+        onDone()
+      } catch (_: Exception) {
+        Toast.makeText(ctx, "Could not apply that edit", Toast.LENGTH_SHORT).show()
+      }
+      busy = false
+    }
+  }
+
+  /** Applies filter [mode] to page [index] (0 = Original). The mode is
+   *  stored per page Uri, so switching pages never resets it, and
+   *  filters never stack: each applies to the stored original. */
+  fun applyFilter(index: Int, mode: Int) {
+    val page = vm.pages.getOrNull(index) ?: return
+    if (busy) {
+      Toast.makeText(ctx, "Please wait — finishing the last edit", Toast.LENGTH_SHORT).show()
+      return
+    }
+    val base = vm.filterOriginals.getOrPut(page.uri) { page.bitmap }
+    vm.filterModes[page.uri] = mode
+    if (mode == 0) replacePage(index, base, newOriginal = base)
+    else replacePage(index, ImagePageEditor.applyFilter(base, mode), newOriginal = base)
+  }
+
+  fun filterModeFor(page: PageItem): Int = vm.filterModes[page.uri] ?: 0
+}
+
+/** The Images-to-PDF options (page size, quality, page numbers,
+ *  watermark, margins), shared by Images to PDF and Scan to PDF. */
+@Composable
+fun ImagesPdfOptionsSection(
+  theme: ChamiTheme,
+  pageSize: String, onPageSize: (String) -> Unit,
+  quality: String, onQuality: (String) -> Unit,
+  pageNumbers: Boolean, onPageNumbers: (Boolean) -> Unit,
+  pageNumberPosition: String, onPageNumberPosition: (String) -> Unit,
+  watermarkOn: Boolean, onWatermarkOn: (Boolean) -> Unit,
+  watermarkText: String, onWatermarkText: (String) -> Unit,
+  watermarkOpacity: Int, onWatermarkOpacity: (Int) -> Unit,
+  watermarkPosition: String, onWatermarkPosition: (String) -> Unit,
+  marginsMm: Int, onMarginsMm: (Int) -> Unit
+) {
+  SectionText("Page size", color = theme.text)
+  Spacer(Modifier.height(Ds.s8))
+  Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+    listOf("A4", "Letter", "Original").forEach { size ->
+      ChamiChip(size, pageSize == size, { onPageSize(size) })
+    }
+  }
+  Spacer(Modifier.height(Ds.s16))
+  SectionText("Image quality", color = theme.text)
+  Spacer(Modifier.height(Ds.s8))
+  Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+    listOf("Original", "High", "Medium", "Low").forEach { q ->
+      ChamiChip(q, quality == q, { onQuality(q) })
+    }
+  }
+  if (quality == "Original") {
+    Spacer(Modifier.height(Ds.s4))
+    HintText("Original embeds the source pixels unmodified — no recompression.")
+  }
+  Spacer(Modifier.height(Ds.s16))
+  Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+    Text("Page numbers", fontSize = Ds.BODY_SP.sp, color = theme.text)
+    Switch(checked = pageNumbers, onCheckedChange = onPageNumbers)
+  }
+  if (pageNumbers) {
+    Spacer(Modifier.height(Ds.s8))
+    Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+      ChamiChip("Bottom centre", pageNumberPosition == "centre", { onPageNumberPosition("centre") })
+      ChamiChip("Bottom right", pageNumberPosition == "right", { onPageNumberPosition("right") })
+    }
+    HintText("Page numbers are drawn at the bottom centre of each PDF page.")
+  }
+  Spacer(Modifier.height(Ds.s16))
+  Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+    Text("Watermark", fontSize = Ds.BODY_SP.sp, color = theme.text)
+    Switch(checked = watermarkOn, onCheckedChange = onWatermarkOn)
+  }
+  if (watermarkOn) {
+    Spacer(Modifier.height(Ds.s8))
+    DebouncedTextField(
+      value = watermarkText, onValueChange = onWatermarkText,
+      label = "Watermark text"
+    )
+    Spacer(Modifier.height(Ds.s12))
+    Text("Opacity: $watermarkOpacity%", fontSize = Ds.BODY_SP.sp, color = theme.text)
+    Slider(
+      value = watermarkOpacity.toFloat(),
+      onValueChange = { onWatermarkOpacity(it.toInt()) },
+      valueRange = 10f..50f,
+      colors = SliderDefaults.colors(thumbColor = theme.primary, activeTrackColor = theme.primary)
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+      ChamiChip("Centre diagonal", watermarkPosition == "centre", { onWatermarkPosition("centre") })
+      ChamiChip("Bottom", watermarkPosition == "bottom", { onWatermarkPosition("bottom") })
+    }
+    Spacer(Modifier.height(Ds.s4))
+    HintText("The watermark is drawn live on the preview above — if you cannot see it there, it will not be in the PDF.")
+  }
+  if (pageSize != "Original") {
+    Spacer(Modifier.height(Ds.s16))
+    SectionText("Margins", color = theme.text)
+    Spacer(Modifier.height(Ds.s8))
+    Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+      ChamiChip("None", marginsMm == 0, { onMarginsMm(0) })
+      ChamiChip("Small (10mm)", marginsMm == 10, { onMarginsMm(10) })
+      ChamiChip("Normal (15mm)", marginsMm == 15, { onMarginsMm(15) })
+    }
+  }
+}
+
+// 1. IMAGES TO PDF
+// - Builds through the shared engine: PdfEngine.buildImagesPdf with
+//   ImagesPdfOptions (quality default Original, A4 default, watermark
+//   off by default with live preview, margins hidden for Original).
+// - Picker loads at full resolution (loadBitmap cap 8000).
+// - Crop CUTS by default (RectCropDialog); Straighten is the separate
+//   warp path. Per-page filter state, correct delete, selection follows
+//   the page Uri, debounced watermark field.
 @Composable
 fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
   val scope = rememberCoroutineScope()
-  var pages by remember { mutableStateOf<List<PageItem>>(emptyList()) }
-  var selectedIndex by remember { mutableStateOf(0) }
+  val vm: PagesViewModel = viewModel(key = "images")
+  val editor = remember(ctx, scope, vm) { PageEditor(ctx, scope, vm) }
   var isProcessing by remember { mutableStateOf(false) }
+  var progressText by remember { mutableStateOf("") }
   var cropIndex by remember { mutableStateOf<Int?>(null) }
-  var cropBusy by remember { mutableStateOf(false) }
+  var straightenIndex by remember { mutableStateOf<Int?>(null) }
   var showFilters by remember { mutableStateOf(false) }
-  var filterMode by remember { mutableStateOf(0) }
-  // Original bitmap per page (keyed by page Uri): a single var lost the
-  // original whenever the user switched pages and came back (H9).
-  val filterOriginals = remember { mutableStateMapOf<Uri, Bitmap>() }
   var showAdjust by remember { mutableStateOf(false) }
   var brightness by remember { mutableStateOf(0f) }
-  var pageSize by remember { mutableStateOf("A4") }
-  var pageNumbers by remember { mutableStateOf(false) }
-  var watermark by remember { mutableStateOf("") }
-  var quality by remember { mutableStateOf("High") }
+  var pageSize by rememberSaveable { mutableStateOf("A4") }
+  var quality by rememberSaveable { mutableStateOf("Original") }
+  var pageNumbers by rememberSaveable { mutableStateOf(false) }
+  var pageNumberPosition by rememberSaveable { mutableStateOf("centre") }
+  var watermarkOn by rememberSaveable { mutableStateOf(false) }
+  var watermarkText by rememberSaveable { mutableStateOf("") }
+  var watermarkOpacity by rememberSaveable { mutableStateOf(25) }
+  var watermarkPosition by rememberSaveable { mutableStateOf("centre") }
+  var marginsMm by rememberSaveable { mutableStateOf(10) }
 
-  // After-convert flow: build -> save picker opens directly -> DoneScreen.
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
   var doneFile by remember { mutableStateOf<File?>(null) }
   var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(
-    ActivityResultContracts.CreateDocument("application/pdf")
-  ) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          Toast.makeText(ctx, "Saved to chosen folder", Toast.LENGTH_SHORT).show()
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
+  val saveFile = rememberSingleFileSaver { file -> doneFile = file; showDone = true }
 
-  val safeSelected = selectedIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+  val pages = vm.pages
+  val safeSelected = vm.selectedIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+  val selectedPage = pages.getOrNull(safeSelected)
+  val filterMode = selectedPage?.let { editor.filterModeFor(it) } ?: 0
 
   fun vibrate() {
     if (tm.hapticOn()) {
@@ -939,70 +1291,18 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     }
   }
 
-  // Apply an edited bitmap to one page: save to a temp file first so the
-  // PDF uses the edited image. Declared before applyFilterMode — local
-  // funs are only visible after their declaration point.
-  fun replacePage(index: Int, newBitmap: Bitmap, closeCrop: Boolean = true) {
-    val page = pages.getOrNull(index) ?: return
-    if (cropBusy) return
-    cropBusy = true
-    scope.launch {
-      try {
-        val newUri = ImagePageEditor.bitmapToUri(
-          ctx, newBitmap, "page_${index}_${System.currentTimeMillis()}.jpg"
-        )
-        val updated = pages.toMutableList()
-        if (index in updated.indices) {
-          updated[index] = PageItem(newUri, newBitmap, cropped = true)
-          pages = updated
-        }
-        if (closeCrop) cropIndex = null
-      } catch (_: Exception) {
-        Toast.makeText(ctx, "Could not apply that edit", Toast.LENGTH_SHORT).show()
-      }
-      cropBusy = false
-    }
-  }
-
-  fun applyFilterMode(mode: Int) {
-    val page = pages.getOrNull(safeSelected) ?: return
-    // Do not move the chip until the edit is accepted: replacePage drops
-    // the edit silently while another edit is still running (H9).
-    if (cropBusy) {
-      Toast.makeText(ctx, "Please wait — finishing the last edit", Toast.LENGTH_SHORT).show()
-      return
-    }
-    val base = filterOriginals.getOrPut(page.uri) { page.bitmap }
-    filterMode = mode
-    if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
-    else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
-  }
-
-  fun deleteSelected() {
-    if (pages.isEmpty()) return
-    pages = pages.filterIndexed { i, _ -> i != safeSelected }
-    selectedIndex = (safeSelected - 1).coerceAtLeast(0)
-    filterOriginals.remove(pages.getOrNull(safeSelected)?.uri)
-    filterMode = 0
-  }
-
-  // Filters never stack and Original restores the page: reset when the
-  // selected page changes.
-  LaunchedEffect(safeSelected) { filterMode = 0 }
-
-  // Multi-select picker. APPENDS to the existing pages — never replaces.
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selected ->
     if (selected.isNotEmpty()) {
       showDone = false
       doneFile = null
       scope.launch(Dispatchers.IO) {
+        // Full resolution: cap 8000 effectively keeps the source pixels.
         val added = selected.mapNotNull { uri ->
-          PdfEngine.loadBitmap(ctx, uri, 1600)?.let { bmp -> PageItem(uri, bmp) }
+          PdfEngine.loadBitmap(ctx, uri, 8000)?.let { bmp -> PageItem(uri, bmp) }
         }
         withContext(Dispatchers.Main) {
           val firstNew = pages.size
-          pages = pages + added
-          selectedIndex = firstNew
+          vm.setPages(pages + added, selectFirstNew = firstNew)
         }
       }
     }
@@ -1014,55 +1314,102 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       return
     }
     isProcessing = true
+    progressText = "Page 1 of ${pages.size}"
     scope.launch {
-      val out = PdfEngine.outFile(ctx, "Chami_${System.currentTimeMillis()}.pdf")
-      val q = when (quality) { "Medium" -> 80; "Low" -> 65; else -> 92 }
-      val ok = withContext(Dispatchers.IO) {
-        buildImagesPdfWithOptions(ctx, pages, out, pageSize, pageNumbers, watermark.trim(), q)
+      val out = PdfEngine.outFile(ctx, "IMG_PDF_${System.currentTimeMillis()}.pdf")
+      val options = ImagesPdfOptions(
+        pageSize = pageSize,
+        quality = quality,
+        watermarkText = if (watermarkOn) watermarkText.trim() else "",
+        watermarkOpacity = watermarkOpacity,
+        watermarkPosition = watermarkPosition,
+        pageNumbers = pageNumbers,
+        marginsMm = if (pageSize == "Original") 0 else marginsMm
+      )
+      val file: File? = try {
+        withContext(Dispatchers.IO) {
+          PdfEngine.buildImagesPdf(ctx, pages.map { it.bitmap }, options) { done, total ->
+            scope.launch { progressText = "Page $done of $total" }
+          }
+        }
+      } catch (e: Exception) {
+        e.printStackTrace()
+        null
       }
       isProcessing = false
-      if (ok) launchSaveFor = out
+      progressText = ""
+      if (file != null) saveFile(file)
       else Toast.makeText(ctx, "Failed to create PDF", Toast.LENGTH_SHORT).show()
     }
   }
 
-  // Crop editor for the selected page.
+  // Live watermark on the preview (downscaled copy — the preview is
+  // 340dp, full resolution is only used at export).
+  val previewBitmap = remember(selectedPage?.bitmap, watermarkOn, watermarkText, watermarkOpacity, watermarkPosition) {
+    val bmp = selectedPage?.bitmap ?: return@remember null
+    if (!watermarkOn || watermarkText.isBlank()) return@remember bmp
+    val maxSide = maxOf(bmp.width, bmp.height)
+    val scaled = if (maxSide > 1200) {
+      val s = 1200f / maxSide
+      Bitmap.createScaledBitmap(bmp, (bmp.width * s).toInt(), (bmp.height * s).toInt(), true)
+    } else bmp
+    watermarkedPreview(scaled, watermarkText.trim(), watermarkOpacity, watermarkPosition)
+  }
+
   cropIndex?.let { index ->
+    val page = pages.getOrNull(index)
+    if (page != null) {
+      RectCropDialog(
+        bitmap = page.bitmap,
+        theme = theme,
+        onApply = { bmp ->
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, bmp, newOriginal = bmp) { cropIndex = null }
+        },
+        onDismiss = { cropIndex = null },
+        onRotate = {
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, ImagePageEditor.rotate90(page.bitmap), newOriginal = null)
+          cropIndex = null
+        }
+      )
+    }
+  }
+  straightenIndex?.let { index ->
     val page = pages.getOrNull(index)
     if (page != null) {
       CropEditorDialog(
         bitmap = page.bitmap,
         theme = theme,
-        onApply = { bmp -> filterOriginals.remove(page.uri); replacePage(index, bmp, closeCrop = true) },
-        onDismiss = { if (!cropBusy) cropIndex = null },
-        onRotate = { filterOriginals.remove(page.uri); replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) }
+        onApply = { bmp ->
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, bmp, newOriginal = bmp) { straightenIndex = null }
+        },
+        onDismiss = { straightenIndex = null },
+        onRotate = {
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, ImagePageEditor.rotate90(page.bitmap), newOriginal = null)
+        }
       )
     }
   }
-
   if (showFilters) {
     FilterPickerDialog(
       selected = filterMode,
       theme = theme,
-      onPick = { mode ->
-        vibrate()
-        applyFilterMode(mode)
-        showFilters = false
-      },
+      onPick = { mode -> vibrate(); editor.applyFilter(safeSelected, mode); showFilters = false },
       onDismiss = { showFilters = false }
     )
   }
-
   if (showAdjust) {
-    val page = pages.getOrNull(safeSelected)
     BrightnessDialog(
       value = brightness,
       theme = theme,
       onValueChange = { brightness = it },
       onApply = {
         showAdjust = false
-        if (page != null) {
-          replacePage(safeSelected, ImagePageEditor.adjustBrightness(page.bitmap, brightness), closeCrop = true)
+        if (selectedPage != null) {
+          editor.replacePage(safeSelected, ImagePageEditor.adjustBrightness(selectedPage.bitmap, brightness))
           brightness = 0f
         }
       },
@@ -1070,8 +1417,6 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     )
   }
 
-  // Done screen is the full screen — the file is visible immediately,
-  // no scrolling down to a result card.
   if (showDone && doneFile != null) {
     DoneScreen(
       file = doneFile!!,
@@ -1084,105 +1429,67 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   ToolScreenContainer("Images to PDF", theme, onBack) {
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Text("Select photos from gallery", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-      Spacer(Modifier.height(14.dp))
+      Text("Select photos from gallery", fontSize = Ds.BODY_SP.sp, color = theme.text)
+      Spacer(Modifier.height(Ds.s16))
 
       if (pages.isEmpty()) {
-        Button(
-          onClick = {
-            vibrate()
-            picker.launch("image/*")
-          },
-          modifier = Modifier.fillMaxWidth().height(48.dp),
-          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-          shape = RoundedCornerShape(8.dp)
-        ) {
-          Text("CHOOSE IMAGES", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-        }
+        ChamiPrimaryButton(
+          text = "Choose images",
+          onClick = { vibrate(); picker.launch("image/*") },
+          modifier = Modifier.fillMaxWidth()
+        )
       } else {
         BigPagePreview(
-          page = pages.getOrNull(safeSelected),
+          page = selectedPage,
           label = "Page ${safeSelected + 1}",
           theme = theme,
           onCrop = { cropIndex = safeSelected },
-          onDelete = { vibrate(); deleteSelected() },
+          onStraighten = { straightenIndex = safeSelected },
+          onDelete = { vibrate(); vm.deleteAt(safeSelected) },
           onFilter = { showFilters = true },
-          onAdjust = { showAdjust = true }
+          onAdjust = { showAdjust = true },
+          watermarkedBitmap = previewBitmap,
+          pageNumber = if (pageNumbers) safeSelected + 1 else null,
+          pageNumberPosition = pageNumberPosition
         )
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(Ds.s8))
         Text(
           "Page ${safeSelected + 1} of ${pages.size}",
-          fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = theme.text
+          fontWeight = FontWeight.Bold, fontSize = Ds.BODY_SP.sp, color = theme.text
         )
-        Spacer(Modifier.height(10.dp))
+        if (pages.size > 50) {
+          Spacer(Modifier.height(Ds.s4))
+          HintText("Over 50 pages — processing may take longer.")
+        }
+        Spacer(Modifier.height(Ds.s12))
         PageThumbnailStrip(
           pages = pages,
           selectedIndex = safeSelected,
           theme = theme,
-          onSelect = { selectedIndex = it },
-          onMove = { from, to ->
-            // Keep the big preview on the page being viewed: only follow
-            // the dragged page when it was the selected one (H12).
-            val wasSelected = selectedIndex
-            pages = ImagePageEditor.move(pages, from, to)
-            selectedIndex = when {
-              from == wasSelected -> to
-              from < wasSelected && to >= wasSelected -> wasSelected - 1
-              from > wasSelected && to <= wasSelected -> wasSelected + 1
-              else -> wasSelected
-            }
-          },
-          onAddPages = {
-            vibrate()
-            picker.launch("image/*")
-          }
+          onSelect = { vm.select(it) },
+          onMove = { from, to -> vm.movePage(from, to) },
+          onAddPages = { vibrate(); picker.launch("image/*") }
         )
-
-        Spacer(Modifier.height(14.dp))
-        Text("PAGE SIZE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          listOf("A4", "Letter", "Original").forEach { size ->
-            Phase6Chip(size, pageSize == size, theme) {
-              vibrate()
-              pageSize = size
-            }
-          }
-        }
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          Phase6Chip("Page numbers", pageNumbers, theme) {
-            vibrate()
-            pageNumbers = !pageNumbers
-          }
-        }
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-          value = watermark,
-          onValueChange = { watermark = it },
-          label = { Text("Watermark (optional)", fontFamily = PixelFont, fontSize = 11.sp) },
-          singleLine = true,
-          modifier = Modifier.fillMaxWidth(),
-          shape = RoundedCornerShape(8.dp)
+        Spacer(Modifier.height(Ds.s24))
+        ImagesPdfOptionsSection(
+          theme = theme,
+          pageSize = pageSize, onPageSize = { pageSize = it },
+          quality = quality, onQuality = { quality = it },
+          pageNumbers = pageNumbers, onPageNumbers = { pageNumbers = it },
+          pageNumberPosition = pageNumberPosition, onPageNumberPosition = { pageNumberPosition = it },
+          watermarkOn = watermarkOn, onWatermarkOn = { watermarkOn = it },
+          watermarkText = watermarkText, onWatermarkText = { watermarkText = it },
+          watermarkOpacity = watermarkOpacity, onWatermarkOpacity = { watermarkOpacity = it },
+          watermarkPosition = watermarkPosition, onWatermarkPosition = { watermarkPosition = it },
+          marginsMm = marginsMm, onMarginsMm = { marginsMm = it }
         )
-        Spacer(Modifier.height(12.dp))
-        Text("IMAGE QUALITY", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          listOf("High", "Medium", "Low").forEach { q ->
-            Phase6Chip(q, quality == q, theme) {
-              vibrate()
-              quality = q
-            }
-          }
-        }
       }
 
-      Spacer(Modifier.height(16.dp))
+      Spacer(Modifier.height(Ds.s16))
       if (isProcessing) {
         LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Creating PDF on IO thread...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Text(progressText, fontSize = Ds.HINT_SP.sp, color = theme.text)
       }
     }
 
@@ -1190,77 +1497,55 @@ fun ImagesToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       label = "Slide to Convert",
       theme = theme,
       enabled = !isProcessing && pages.isNotEmpty(),
-      onSlideComplete = {
-        vibrate()
-        buildPdf()
-      }
+      onSlideComplete = { vibrate(); buildPdf() }
     )
   }
 }
 
-// 2. SCAN TO PDF — Phase 6: same redesign as Images to PDF (big preview
-// showing the selected page, left-corner Crop/Delete/Filter/Adjust stack,
-// thumbnail strip with big "+" tile, Slide to Save PDF, haptic on slide).
-// CAMERA: opening Scan opens the camera directly (ScanCameraScreen, full
-// screen) while no pages exist yet. After pages exist the preview is shown;
-// the "+" tile offers Camera / Gallery. Auto-capture toggle is passed to
-// the camera screen; batch scan = the camera stays open after each capture
-// (ScanCameraScreen stays open; onCaptured only appends a page).
+// 2. SCAN TO PDF — same options engine as Images to PDF (quality /
+// watermark / page size honoured), same preview system. The camera
+// opens directly on first entry; batch scan stays open after each
+// capture. RETAKE never deletes the current page first: it only
+// replaces it after a new capture succeeds. Scanned pages default to
+// the Enhance filter.
 @Composable
 fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
   val haptic = LocalHapticFeedback.current
   val tm = remember { ThemeManager(ctx) }
   val scope = rememberCoroutineScope()
-  var pages by remember { mutableStateOf<List<PageItem>>(emptyList()) }
-  var selectedPage by remember { mutableStateOf(0) }
-  var filterMode by remember { mutableStateOf(0) }
-  var showFilters by remember { mutableStateOf(false) }
-  val scanOriginals = remember { mutableStateMapOf<Uri, Bitmap>() }
-  var autoQuad by remember { mutableStateOf<List<Offset>?>(null) }
+  val vm: PagesViewModel = viewModel(key = "scan")
+  val editor = remember(ctx, scope, vm) { PageEditor(ctx, scope, vm) }
   var isProcessing by remember { mutableStateOf(false) }
+  var progressText by remember { mutableStateOf("") }
   var cropIndex by remember { mutableStateOf<Int?>(null) }
-  var editBusy by remember { mutableStateOf(false) }
+  var straightenIndex by remember { mutableStateOf<Int?>(null) }
+  var autoQuad by remember { mutableStateOf<List<Offset>?>(null) }
+  var showFilters by remember { mutableStateOf(false) }
   var showAdjust by remember { mutableStateOf(false) }
   var brightness by remember { mutableStateOf(0f) }
-  var autoCapture by remember { mutableStateOf(false) }
+  var autoCapture by rememberSaveable { mutableStateOf(false) }
   var showCamera by remember { mutableStateOf(false) }
   var showAddSource by remember { mutableStateOf(false) }
+  var retakeIndex by remember { mutableStateOf<Int?>(null) }
+  var pageSize by rememberSaveable { mutableStateOf("A4") }
+  var quality by rememberSaveable { mutableStateOf("Original") }
+  var pageNumbers by rememberSaveable { mutableStateOf(false) }
+  var pageNumberPosition by rememberSaveable { mutableStateOf("centre") }
+  var watermarkOn by rememberSaveable { mutableStateOf(false) }
+  var watermarkText by rememberSaveable { mutableStateOf("") }
+  var watermarkOpacity by rememberSaveable { mutableStateOf(25) }
+  var watermarkPosition by rememberSaveable { mutableStateOf("centre") }
+  var marginsMm by rememberSaveable { mutableStateOf(10) }
 
-  // After-convert flow: build -> save picker opens directly -> DoneScreen.
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
   var doneFile by remember { mutableStateOf<File?>(null) }
   var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(
-    ActivityResultContracts.CreateDocument("application/pdf")
-  ) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          Toast.makeText(ctx, "Saved to chosen folder", Toast.LENGTH_SHORT).show()
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
+  val saveFile = rememberSingleFileSaver { file -> doneFile = file; showDone = true }
 
-  val safeSelected = selectedPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+  val pages = vm.pages
+  val safeSelected = vm.selectedIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+  val selectedPage = pages.getOrNull(safeSelected)
+  val filterMode = selectedPage?.let { editor.filterModeFor(it) } ?: 0
   val filterNames = listOf("Original", "B&W", "Grayscale", "Enhance")
 
   fun vibrate() {
@@ -1269,175 +1554,155 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     }
   }
 
-  // Runtime camera permission launcher.
   val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
-    if (isGranted) {
-      showCamera = true
-    } else {
-      Toast.makeText(ctx, "Camera permission needed. You can also pick from gallery.", Toast.LENGTH_LONG).show()
-    }
+    if (isGranted) showCamera = true
+    else Toast.makeText(ctx, "Camera permission needed. You can also pick from gallery.", Toast.LENGTH_LONG).show()
   }
 
   fun requestCamera() {
-    val permission = Manifest.permission.CAMERA
-    if (ContextCompat.checkSelfPermission(ctx, permission) == PackageManager.PERMISSION_GRANTED) {
+    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
       showCamera = true
     } else {
-      permissionLauncher.launch(permission)
+      permissionLauncher.launch(Manifest.permission.CAMERA)
     }
   }
 
-  // Open the camera directly on first entry (no pages yet).
   LaunchedEffect(Unit) {
     if (pages.isEmpty()) requestCamera()
   }
 
-  // Apply an edited bitmap to one page (crop / rotate / filter / adjust).
-  // Declared before applyFilterMode — local funs are only visible after
-  // their declaration point.
-  fun replacePage(index: Int, newBitmap: Bitmap, closeCrop: Boolean = true) {
-    val page = pages.getOrNull(index) ?: return
-    if (editBusy) return
-    editBusy = true
-    scope.launch {
-      try {
-        val newUri = ImagePageEditor.bitmapToUri(
-          ctx, newBitmap, "scan_${index}_${System.currentTimeMillis()}.jpg"
-        )
-        val updated = pages.toMutableList()
-        if (index in updated.indices) {
-          updated[index] = PageItem(newUri, newBitmap, cropped = true)
-          pages = updated
-        }
-        if (closeCrop) cropIndex = null
-      } catch (_: Exception) {
-        Toast.makeText(ctx, "Could not apply that edit", Toast.LENGTH_SHORT).show()
-      }
-      editBusy = false
-    }
-  }
-
-  fun applyFilterMode(mode: Int) {
-    val page = pages.getOrNull(safeSelected) ?: return
-    if (editBusy) {
-      Toast.makeText(ctx, "Please wait — finishing the last edit", Toast.LENGTH_SHORT).show()
-      return
-    }
-    val base = scanOriginals.getOrPut(page.uri) { page.bitmap }
-    filterMode = mode
-    if (mode == 0) replacePage(safeSelected, base, closeCrop = true)
-    else replacePage(safeSelected, ImagePageEditor.applyFilter(base, mode), closeCrop = true)
-  }
-
-  fun deleteSelected() {
-    if (pages.isEmpty()) return
-    pages = pages.filterIndexed { i, _ -> i != safeSelected }
-    selectedPage = (safeSelected - 1).coerceAtLeast(0)
-    scanOriginals.remove(pages.getOrNull(safeSelected)?.uri)
-    filterMode = 0
-  }
-
-  // Filters never stack and Original restores the page: reset when the
-  // selected page changes.
-  LaunchedEffect(safeSelected) { filterMode = 0; showFilters = false }
-
-  // Gallery: multi-select. Each selected image APPENDS a page.
   val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selected ->
     if (selected.isNotEmpty()) {
       showDone = false
       doneFile = null
       scope.launch(Dispatchers.IO) {
         val added = selected.mapNotNull { uri ->
-          PdfEngine.loadBitmap(ctx, uri, 1600)?.let { bmp -> PageItem(uri, bmp) }
+          PdfEngine.loadBitmap(ctx, uri, 8000)?.let { bmp -> PageItem(uri, bmp) }
         }
         withContext(Dispatchers.Main) {
           val firstNew = pages.size
-          pages = pages + added
-          selectedPage = firstNew
+          vm.setPages(pages + added, selectFirstNew = firstNew)
         }
       }
     }
   }
 
-  // Builds the PDF from the CURRENT page order and Uris.
   fun buildPdf() {
     if (pages.isEmpty()) {
       Toast.makeText(ctx, "Capture or select a document first", Toast.LENGTH_SHORT).show()
       return
     }
     isProcessing = true
+    progressText = "Page 1 of ${pages.size}"
     scope.launch {
       val out = PdfEngine.outFile(ctx, "Scan_${System.currentTimeMillis()}.pdf")
-      val ok = withContext(Dispatchers.IO) {
-        PdfEngine.imagesToPdf(ctx, pages.map { it.uri }, out)
+      val options = ImagesPdfOptions(
+        pageSize = pageSize,
+        quality = quality,
+        watermarkText = if (watermarkOn) watermarkText.trim() else "",
+        watermarkOpacity = watermarkOpacity,
+        watermarkPosition = watermarkPosition,
+        pageNumbers = pageNumbers,
+        marginsMm = if (pageSize == "Original") 0 else marginsMm
+      )
+      val file: File? = try {
+        withContext(Dispatchers.IO) {
+          PdfEngine.buildImagesPdf(ctx, pages.map { it.bitmap }, options) { done, total ->
+            scope.launch { progressText = "Page $done of $total" }
+          }
+        }
+      } catch (e: Exception) {
+        e.printStackTrace()
+        null
       }
       isProcessing = false
-      if (ok) launchSaveFor = out
+      progressText = ""
+      if (file != null) saveFile(file)
       else Toast.makeText(ctx, "Failed to create PDF", Toast.LENGTH_SHORT).show()
     }
   }
 
-  // Crop editor for the selected page.
+  val previewBitmap = remember(selectedPage?.bitmap, watermarkOn, watermarkText, watermarkOpacity, watermarkPosition) {
+    val bmp = selectedPage?.bitmap ?: return@remember null
+    if (!watermarkOn || watermarkText.isBlank()) return@remember bmp
+    val maxSide = maxOf(bmp.width, bmp.height)
+    val scaled = if (maxSide > 1200) {
+      val s = 1200f / maxSide
+      Bitmap.createScaledBitmap(bmp, (bmp.width * s).toInt(), (bmp.height * s).toInt(), true)
+    } else bmp
+    watermarkedPreview(scaled, watermarkText.trim(), watermarkOpacity, watermarkPosition)
+  }
+
   cropIndex?.let { index ->
+    val page = pages.getOrNull(index)
+    if (page != null) {
+      RectCropDialog(
+        bitmap = page.bitmap,
+        theme = theme,
+        onApply = { bmp ->
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, bmp, newOriginal = bmp) { cropIndex = null }
+        },
+        onDismiss = { cropIndex = null },
+        onRotate = {
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, ImagePageEditor.rotate90(page.bitmap), newOriginal = null)
+          cropIndex = null
+        }
+      )
+    }
+  }
+  straightenIndex?.let { index ->
     val page = pages.getOrNull(index)
     if (page != null) {
       CropEditorDialog(
         bitmap = page.bitmap,
         theme = theme,
-        onApply = { bmp -> scanOriginals.remove(page.uri); replacePage(index, bmp, closeCrop = true) },
-        onDismiss = { if (!editBusy) { cropIndex = null; autoQuad = null } },
-        onRotate = { scanOriginals.remove(page.uri); replacePage(index, ImagePageEditor.rotate90(page.bitmap), closeCrop = false) },
+        onApply = { bmp ->
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, bmp, newOriginal = bmp) { straightenIndex = null; autoQuad = null }
+        },
+        onDismiss = { straightenIndex = null; autoQuad = null },
+        onRotate = {
+          vm.filterOriginals.remove(page.uri)
+          editor.replacePage(index, ImagePageEditor.rotate90(page.bitmap), newOriginal = null)
+        },
         initialQuad = autoQuad
       )
     }
   }
-
   if (showFilters) {
     FilterPickerDialog(
       selected = filterMode,
       theme = theme,
-      onPick = { mode ->
-        vibrate()
-        applyFilterMode(mode)
-        showFilters = false
-      },
+      onPick = { mode -> vibrate(); editor.applyFilter(safeSelected, mode); showFilters = false },
       onDismiss = { showFilters = false }
     )
   }
-
   if (showAdjust) {
-    val page = pages.getOrNull(safeSelected)
     BrightnessDialog(
       value = brightness,
       theme = theme,
       onValueChange = { brightness = it },
       onApply = {
         showAdjust = false
-        if (page != null) {
-          replacePage(safeSelected, ImagePageEditor.adjustBrightness(page.bitmap, brightness), closeCrop = true)
+        if (selectedPage != null) {
+          editor.replacePage(safeSelected, ImagePageEditor.adjustBrightness(selectedPage.bitmap, brightness))
           brightness = 0f
         }
       },
       onDismiss = { showAdjust = false; brightness = 0f }
     )
   }
-
   if (showAddSource) {
     AddPageSourceDialog(
       theme = theme,
-      onCamera = {
-        showAddSource = false
-        requestCamera()
-      },
-      onGallery = {
-        showAddSource = false
-        galleryLauncher.launch("image/*")
-      },
+      onCamera = { showAddSource = false; requestCamera() },
+      onGallery = { showAddSource = false; galleryLauncher.launch("image/*") },
       onDismiss = { showAddSource = false }
     )
   }
 
-  // Done screen is the full screen — the file is visible immediately.
   if (showDone && doneFile != null) {
     DoneScreen(
       file = doneFile!!,
@@ -1449,8 +1714,8 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   }
 
   // Camera first: while no pages exist yet the camera opens directly.
-  // Batch scan: onCaptured only appends — the camera screen stays open
-  // until the user closes it (onClose), then the preview is shown.
+  // Batch scan: onCaptured only appends (or replaces the retake page
+  // after a successful capture) — the camera stays open until closed.
   if (showCamera) {
     ScanCameraScreen(
       theme = theme,
@@ -1459,10 +1724,22 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         scope.launch(Dispatchers.IO) {
           val f = File(ctx.cacheDir, "scan_${System.currentTimeMillis()}.jpg")
           FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+          // Scanned pages default to the Enhance filter.
+          val enhanced = ImagePageEditor.applyFilter(bmp, 3)
+          val uri = Uri.fromFile(f)
           withContext(Dispatchers.Main) {
-            val firstNew = pages.size
-            pages = pages + PageItem(Uri.fromFile(f), bmp)
-            selectedPage = firstNew
+            val target = retakeIndex
+            if (target != null && target in pages.indices) {
+              // Retake: replace only now that the capture succeeded.
+              vm.filterOriginals.remove(pages[target].uri)
+              editor.replacePage(target, enhanced, newOriginal = bmp)
+              retakeIndex = null
+            } else {
+              val firstNew = pages.size
+              vm.filterOriginals[uri] = bmp
+              vm.filterModes[uri] = 3
+              vm.setPages(pages + PageItem(uri, enhanced), selectFirstNew = firstNew)
+            }
           }
         }
       },
@@ -1470,7 +1747,7 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
         showCamera = false
         galleryLauncher.launch("image/*")
       },
-      onClose = { showCamera = false }
+      onClose = { showCamera = false; retakeIndex = null }
     )
     return
   }
@@ -1478,145 +1755,119 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   ToolScreenContainer("Scan to PDF", theme, onBack) {
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
       if (pages.isEmpty()) {
-        Text("Point the camera at a page, or pick pages from the gallery.", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-        Spacer(Modifier.height(14.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          Button(
-            onClick = {
-              vibrate()
-              requestCamera()
-            },
-            modifier = Modifier.weight(1f).height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("📷 CAMERA", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-          }
-          Button(
-            onClick = {
-              vibrate()
-              galleryLauncher.launch("image/*")
-            },
-            modifier = Modifier.weight(1f).height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("🖼️ GALLERY", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-          }
+        Text("Point the camera at a page, or pick pages from the gallery.", fontSize = Ds.BODY_SP.sp, color = theme.text)
+        Spacer(Modifier.height(Ds.s16))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          ChamiPrimaryButton(text = "Camera", onClick = { vibrate(); requestCamera() }, modifier = Modifier.weight(1f))
+          ChamiPrimaryButton(text = "Gallery", onClick = { vibrate(); galleryLauncher.launch("image/*") }, modifier = Modifier.weight(1f))
         }
-        Spacer(Modifier.height(14.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          Phase6Chip("Auto-capture", autoCapture, theme) {
-            vibrate()
-            autoCapture = !autoCapture
-          }
+        Spacer(Modifier.height(Ds.s16))
+        Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          ChamiChip("Auto-capture", autoCapture, { vibrate(); autoCapture = !autoCapture })
         }
+        HintText("Auto-capture takes a photo when the page is steady. The shutter always works.")
       } else {
-        val page = pages[safeSelected]
         BigPagePreview(
-          page = page,
+          page = selectedPage,
           label = "Page ${safeSelected + 1}",
           theme = theme,
           onCrop = { cropIndex = safeSelected },
-          onDelete = { vibrate(); deleteSelected() },
+          onStraighten = { straightenIndex = safeSelected },
+          onDelete = { vibrate(); vm.deleteAt(safeSelected) },
           onFilter = { showFilters = true },
-          onAdjust = { showAdjust = true }
+          onAdjust = { showAdjust = true },
+          watermarkedBitmap = previewBitmap,
+          pageNumber = if (pageNumbers) safeSelected + 1 else null,
+          pageNumberPosition = pageNumberPosition
         )
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(Ds.s8))
         Row(
           Modifier.fillMaxWidth(),
           horizontalArrangement = Arrangement.Center,
           verticalAlignment = Alignment.CenterVertically
         ) {
-          OutlinedButton(
-            onClick = { if (safeSelected > 0) selectedPage = safeSelected - 1 },
-            enabled = safeSelected > 0,
-            shape = RoundedCornerShape(8.dp),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-          ) { Text("‹", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = theme.text) }
-          Spacer(Modifier.width(12.dp))
+          ChamiIconButton(
+            icon = Icons.Filled.ChevronLeft, description = "Previous page",
+            onClick = { if (safeSelected > 0) vm.select(safeSelected - 1) }
+          )
           Text(
             "Page ${safeSelected + 1} of ${pages.size}",
-            fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = theme.text
+            fontWeight = FontWeight.Bold, fontSize = Ds.BODY_SP.sp, color = theme.text,
+            modifier = Modifier.padding(horizontal = Ds.s12)
           )
-          Spacer(Modifier.width(12.dp))
-          OutlinedButton(
-            onClick = { if (safeSelected < pages.lastIndex) selectedPage = safeSelected + 1 },
-            enabled = safeSelected < pages.lastIndex,
-            shape = RoundedCornerShape(8.dp),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-          ) { Text("›", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = theme.text) }
+          ChamiIconButton(
+            icon = Icons.Filled.ChevronRight, description = "Next page",
+            onClick = { if (safeSelected < pages.lastIndex) vm.select(safeSelected + 1) }
+          )
         }
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(Ds.s12))
         PageThumbnailStrip(
           pages = pages,
           selectedIndex = safeSelected,
           theme = theme,
-          onSelect = { selectedPage = it },
-          onMove = { from, to ->
-            val wasSelected = selectedPage
-            pages = ImagePageEditor.move(pages, from, to)
-            selectedPage = when {
-              from == wasSelected -> to
-              from < wasSelected && to >= wasSelected -> wasSelected - 1
-              from > wasSelected && to <= wasSelected -> wasSelected + 1
-              else -> wasSelected
-            }
-          },
-          onAddPages = {
-            vibrate()
-            showAddSource = true
-          }
+          onSelect = { vm.select(it) },
+          onMove = { from, to -> vm.movePage(from, to) },
+          onAddPages = { vibrate(); showAddSource = true }
         )
-        Spacer(Modifier.height(12.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          OutlinedButton(
+        Spacer(Modifier.height(Ds.s12))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          ChamiSecondaryButton(
+            text = "Keep scanning",
+            onClick = { vibrate(); requestCamera() },
+            modifier = Modifier.weight(1f)
+          )
+          ChamiSecondaryButton(
+            text = "Retake page",
             onClick = {
               vibrate()
-              deleteSelected()
+              // Do NOT delete the page: it is replaced only after a
+              // new capture succeeds (see onCaptured / retakeIndex).
+              retakeIndex = safeSelected
               requestCamera()
             },
-            modifier = Modifier.weight(1f).height(44.dp),
-            shape = RoundedCornerShape(8.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-          ) {
-            Text("📷 RETAKE PAGE", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = theme.text)
-          }
-          OutlinedButton(
+            modifier = Modifier.weight(1f)
+          )
+        }
+        Spacer(Modifier.height(Ds.s12))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          ChamiSecondaryButton(
+            text = "Auto-detect edges",
             onClick = {
               vibrate()
               val pg = pages.getOrNull(safeSelected)
               if (pg != null) {
                 autoQuad = ImagePageEditor.detectDocumentQuad(pg.bitmap)
-                cropIndex = safeSelected
+                straightenIndex = safeSelected
               }
             },
-            modifier = Modifier.weight(1f).height(44.dp),
-            shape = RoundedCornerShape(8.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-          ) {
-            Text("AUTO-DETECT EDGES", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = theme.text)
-          }
+            modifier = Modifier.weight(1f)
+          )
+          ChamiChip("Auto-capture", autoCapture, { vibrate(); autoCapture = !autoCapture })
         }
-        Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          Phase6Chip("Auto-capture", autoCapture, theme) {
-            vibrate()
-            autoCapture = !autoCapture
-          }
-          if (filterMode != 0) {
-            Phase6Chip(filterNames[filterMode], true, theme) { showFilters = true }
-          }
+        if (filterMode != 0) {
+          Spacer(Modifier.height(Ds.s8))
+          HintText("Filter on this page: ${filterNames[filterMode]}")
         }
+        Spacer(Modifier.height(Ds.s24))
+        ImagesPdfOptionsSection(
+          theme = theme,
+          pageSize = pageSize, onPageSize = { pageSize = it },
+          quality = quality, onQuality = { quality = it },
+          pageNumbers = pageNumbers, onPageNumbers = { pageNumbers = it },
+          pageNumberPosition = pageNumberPosition, onPageNumberPosition = { pageNumberPosition = it },
+          watermarkOn = watermarkOn, onWatermarkOn = { watermarkOn = it },
+          watermarkText = watermarkText, onWatermarkText = { watermarkText = it },
+          watermarkOpacity = watermarkOpacity, onWatermarkOpacity = { watermarkOpacity = it },
+          watermarkPosition = watermarkPosition, onWatermarkPosition = { watermarkPosition = it },
+          marginsMm = marginsMm, onMarginsMm = { marginsMm = it }
+        )
       }
 
-      Spacer(Modifier.height(16.dp))
+      Spacer(Modifier.height(Ds.s16))
       if (isProcessing) {
         LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Building scanned PDF document...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Text(progressText, fontSize = Ds.HINT_SP.sp, color = theme.text)
       }
     }
 
@@ -1624,19 +1875,16 @@ fun ScanToPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
       label = "Slide to Save PDF",
       theme = theme,
       enabled = !isProcessing && pages.isNotEmpty(),
-      onSlideComplete = {
-        vibrate()
-        buildPdf()
-      }
+      onSlideComplete = { vibrate(); buildPdf() }
     )
   }
 }
 
-// 3. PDF TO IMAGES — Phase 6 extras: JPG/PNG choice, resolution choice,
-// page range. Renders with PdfReader.renderPageBitmap (verified API) so
-// format / resolution / range are honoured — PdfEngine.pdfToImages is
-// fixed JPG-85 / all-pages. Slide to Extract, then DoneScreen with the
-// first extracted image (no folder picker: images go to internal storage).
+// 3. PDF TO IMAGES — JPG (default) / PNG, resolution Screen 150 /
+// High 300 (default) / Print 600 DPI, page range with live validation,
+// per-page progress, images named NAME_p1, NAME_p2... The save folder
+// is asked ONCE and every image is saved there, then a Done screen
+// lists them all.
 @Composable
 fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
@@ -1647,16 +1895,21 @@ fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
   var totalPages by remember { mutableStateOf(0) }
   var pageOnePreview by remember { mutableStateOf<Bitmap?>(null) }
   var isProcessing by remember { mutableStateOf(false) }
-  var extractedCount by remember { mutableStateOf(0) }
-  var outDir by remember { mutableStateOf<File?>(null) }
-  var format by remember { mutableStateOf("JPG") }
-  var resolution by remember { mutableStateOf("High") }
-  var rangeFrom by remember { mutableStateOf("1") }
-  var rangeTo by remember { mutableStateOf("") }
+  var progressText by remember { mutableStateOf("") }
+  var format by rememberSaveable { mutableStateOf("JPG") }
+  var resolution by rememberSaveable { mutableStateOf("High 300") }
+  var rangeFrom by rememberSaveable { mutableStateOf("1") }
+  var rangeTo by rememberSaveable { mutableStateOf("") }
 
-  var doneFile by remember { mutableStateOf<File?>(null) }
+  var doneFiles by remember { mutableStateOf<List<DoneFileInfo>?>(null) }
   var showDone by remember { mutableStateOf(false) }
-
+  val folderSave = rememberFolderSaver(
+    onSaved = { files ->
+      doneFiles = files.map { DoneFileInfo(it, if (format == "PNG") "image/png" else "image/jpeg", formatSizeText(it.length())) }
+      showDone = true
+    },
+    onCancelled = { Toast.makeText(ctx, "Save cancelled — images kept in Chami folder", Toast.LENGTH_SHORT).show() }
+  )
   fun vibrate() {
     if (tm.hapticOn()) {
       try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
@@ -1665,10 +1918,9 @@ fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
     pdfUri = selected
-    extractedCount = 0
     pageOnePreview = null
     showDone = false
-    doneFile = null
+    doneFiles = null
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
         val n = PdfEngine.pageCount(ctx, selected)
@@ -1683,47 +1935,60 @@ fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
     }
   }
 
+  val fromInt = rangeFrom.toIntOrNull()
+  val toInt = rangeTo.toIntOrNull()
+  val rangeValid = pdfUri == null || (fromInt != null && toInt != null && fromInt in 1..totalPages && toInt in fromInt..totalPages)
+  val imageCount = if (rangeValid && fromInt != null && toInt != null) toInt - fromInt + 1 else 0
+
   fun extract() {
     val u = pdfUri ?: return
+    if (!rangeValid) {
+      Toast.makeText(ctx, "Check the page range first", Toast.LENGTH_SHORT).show()
+      return
+    }
     isProcessing = true
     scope.launch {
       val dir = File(ctx.getExternalFilesDir(null), "Chami/Images_${System.currentTimeMillis()}")
       if (!dir.exists()) dir.mkdirs()
-      val maxPages = totalPages.coerceAtLeast(1)
-      val from = (rangeFrom.toIntOrNull() ?: 1).coerceIn(1, maxPages)
-      val to = (rangeTo.toIntOrNull() ?: maxPages).coerceIn(from, maxPages)
-      val scale = when (resolution) { "Low" -> 1.0f; "Medium" -> 1.5f; else -> 2.0f }
+      val from = fromInt ?: 1
+      val to = toInt ?: totalPages
+      val dpi = when (resolution) { "Screen 150" -> 150; "Print 600" -> 600; else -> 300 }
+      val scale = dpi / 72f
       val fmt = if (format == "PNG") Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
       val ext = if (format == "PNG") "png" else "jpg"
-      var count = 0
-      var first: File? = null
+      val base = baseNameOf(ctx, u, "PDF")
+      val files = mutableListOf<File>()
       withContext(Dispatchers.IO) {
         for (p in from..to) {
+          withContext(Dispatchers.Main) { progressText = "Image ${p - from + 1} of ${to - from + 1}" }
           val bmp = PdfReader.renderPageBitmap(ctx, u, p - 1, scale) ?: continue
-          val f = File(dir, "page_$p.$ext")
+          val f = File(dir, "${base}_p$p.$ext")
           try {
             FileOutputStream(f).use { bmp.compress(fmt, 90, it) }
-            count++
-            if (first == null) first = f
+            files.add(f)
           } catch (_: Exception) { }
           bmp.recycle()
         }
       }
       isProcessing = false
-      extractedCount = count
-      outDir = dir
-      if (count > 0 && first != null) {
-        doneFile = first
-        showDone = true
+      progressText = ""
+      if (files.isNotEmpty()) {
+        val mime = if (format == "PNG") "image/png" else "image/jpeg"
+        folderSave(files.map { it to mime })
       } else {
         Toast.makeText(ctx, "Could not extract images", Toast.LENGTH_SHORT).show()
       }
     }
   }
 
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
+  if (showDone && doneFiles != null) {
+    MultiDoneScreen(
+      files = doneFiles!!,
+      title = "Images extracted",
+      summaryLines = listOf(
+        "${doneFiles!!.size} images created as $format at $resolution DPI.",
+        "Saved to the folder you chose."
+      ),
       theme = theme,
       onBackHome = onBack,
       onOpen = { ShareHelper.openFile(ctx, it, if (format == "PNG") "image/png" else "image/jpeg") }
@@ -1733,124 +1998,108 @@ fun PdfToImagesScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   ToolScreenContainer("PDF to Images", theme, onBack) {
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Button(
-        onClick = {
-          vibrate()
-          picker.launch("application/pdf")
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text(if (pdfUri != null) "PDF SELECTED ($totalPages PAGES) ✓" else "SELECT PDF", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-      }
+      ChamiSecondaryButton(
+        text = if (pdfUri != null) "PDF selected ($totalPages pages)" else "Select PDF",
+        onClick = { vibrate(); picker.launch("application/pdf") },
+        modifier = Modifier.fillMaxWidth()
+      )
 
       if (pageOnePreview != null) {
-        Spacer(Modifier.height(16.dp))
-        Text("PREVIEW (PAGE 1 OF $totalPages):", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(Ds.s16))
+        SectionText("Preview (page 1 of $totalPages)", color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
         Column(
           modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(Ds.s8))
             .background(theme.card)
-            .padding(10.dp),
+            .padding(Ds.s12),
           horizontalAlignment = Alignment.CenterHorizontally
         ) {
           Image(
             bitmap = pageOnePreview!!.asImageBitmap(),
             contentDescription = "Page 1 Preview",
-            modifier = Modifier
-              .fillMaxWidth()
-              .heightIn(max = 420.dp)
-              .clip(RoundedCornerShape(6.dp)),
+            modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp).clip(RoundedCornerShape(Ds.s8)),
             contentScale = ContentScale.Fit
           )
         }
       }
 
       if (pdfUri != null) {
-        Spacer(Modifier.height(14.dp))
-        Text("FORMAT", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Spacer(Modifier.height(Ds.s16))
+        SectionText("Format", color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
           listOf("JPG", "PNG").forEach { f ->
-            Phase6Chip(f, format == f, theme) {
-              vibrate()
-              format = f
-            }
+            ChamiChip(f, format == f, { vibrate(); format = f })
           }
         }
-        Spacer(Modifier.height(12.dp))
-        Text("RESOLUTION", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          listOf("Low", "Medium", "High").forEach { r ->
-            Phase6Chip(r, resolution == r, theme) {
-              vibrate()
-              resolution = r
-            }
+        if (format == "PNG") {
+          Spacer(Modifier.height(Ds.s4))
+          HintText("PNG files are larger than JPG.")
+        }
+        Spacer(Modifier.height(Ds.s16))
+        SectionText("Resolution", color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          listOf("Screen 150", "High 300", "Print 600").forEach { r ->
+            ChamiChip(r, resolution == r, { vibrate(); resolution = r })
           }
         }
-        Spacer(Modifier.height(12.dp))
-        Text("PAGE RANGE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          OutlinedTextField(
-            value = rangeFrom,
-            onValueChange = { rangeFrom = it.filter { ch -> ch.isDigit() } },
-            label = { Text("From", fontFamily = PixelFont, fontSize = 10.sp) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        Spacer(Modifier.height(Ds.s16))
+        SectionText("Page range", color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          DebouncedTextField(
+            value = rangeFrom, onValueChange = { rangeFrom = it.filter { ch -> ch.isDigit() } },
+            label = "From page", keyboardType = KeyboardType.Number,
+            isError = !rangeValid,
             modifier = Modifier.weight(1f)
           )
-          OutlinedTextField(
-            value = rangeTo,
-            onValueChange = { rangeTo = it.filter { ch -> ch.isDigit() } },
-            label = { Text("To", fontFamily = PixelFont, fontSize = 10.sp) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+          DebouncedTextField(
+            value = rangeTo, onValueChange = { rangeTo = it.filter { ch -> ch.isDigit() } },
+            label = "To page", keyboardType = KeyboardType.Number,
+            isError = !rangeValid,
             modifier = Modifier.weight(1f)
+          )
+        }
+        if (!rangeValid) {
+          Spacer(Modifier.height(Ds.s4))
+          Text(
+            "Enter pages from 1 to $totalPages, From before To.",
+            fontSize = Ds.HINT_SP.sp, color = ChamiColors.errorRed
+          )
+        } else if (imageCount > 0) {
+          Spacer(Modifier.height(Ds.s8))
+          Text(
+            "$imageCount image${if (imageCount == 1) "" else "s"} will be created",
+            fontSize = Ds.BODY_SP.sp, fontWeight = FontWeight.SemiBold, color = theme.text
           )
         }
       }
 
-      Spacer(Modifier.height(16.dp))
+      Spacer(Modifier.height(Ds.s16))
       if (isProcessing) {
         LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Rendering pages...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-      }
-
-      if (extractedCount > 0 && outDir != null) {
-        Column(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card)
-            .padding(14.dp)
-        ) {
-          Text("Success ✓", fontFamily = PixelFont, fontWeight = FontWeight.Bold, color = theme.primaryDark, fontSize = 14.sp)
-          Spacer(Modifier.height(4.dp))
-          Text("Extracted $extractedCount pages as $format", fontFamily = PixelFont, color = theme.text, fontSize = 12.sp)
-        }
+        Spacer(Modifier.height(Ds.s8))
+        Text(progressText, fontSize = Ds.HINT_SP.sp, color = theme.text)
       }
     }
 
     SlideToAction(
       label = "Slide to Extract",
       theme = theme,
-      enabled = !isProcessing && pdfUri != null,
-      onSlideComplete = {
-        vibrate()
-        extract()
-      }
+      enabled = !isProcessing && pdfUri != null && rangeValid,
+      onSlideComplete = { vibrate(); extract() }
     )
   }
 }
 
-// 4. SPLIT PDF — Phase 6 extras: split by page range (from/to fields) and
-// split every 5 pages (one file per 5-page chunk; the first chunk goes
-// through the save picker + DoneScreen, the rest stay in internal storage
-// and are counted in a toast). Selected-pages mode is kept as before.
+// 4. SPLIT PDF — Range (live validation, thumbnails in range highlight),
+// Every N (parts previewed before splitting), Extract selected (grid
+// with tick overlay + Select all / Clear). Multi-part output asks the
+// save folder ONCE and saves every part there. NOTE: copyPages renders
+// pages as images, so text in split output is not selectable.
 @Composable
 fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   val ctx = LocalContext.current
@@ -1863,38 +2112,23 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
   var previewPageIndex by remember { mutableStateOf(1) }
   var pagePreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
   var isProcessing by remember { mutableStateOf(false) }
-  var splitMode by remember { mutableStateOf("Selected") }
-  var rangeFrom by remember { mutableStateOf("1") }
-  var rangeTo by remember { mutableStateOf("") }
+  var progressText by remember { mutableStateOf("") }
+  var splitMode by rememberSaveable { mutableStateOf("Selected") }
+  var rangeFrom by rememberSaveable { mutableStateOf("1") }
+  var rangeTo by rememberSaveable { mutableStateOf("") }
+  var everyN by rememberSaveable { mutableStateOf("5") }
 
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
   var doneFile by remember { mutableStateOf<File?>(null) }
+  var doneFiles by remember { mutableStateOf<List<DoneFileInfo>?>(null) }
   var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
+  val singleSave = rememberSingleFileSaver { file -> doneFile = file; showDone = true }
+  val folderSave = rememberFolderSaver(
+    onSaved = { files ->
+      doneFiles = files.map { DoneFileInfo(it, "application/pdf", formatSizeText(it.length())) }
+      showDone = true
+    },
+    onCancelled = { Toast.makeText(ctx, "Save cancelled — files kept in Chami folder", Toast.LENGTH_SHORT).show() }
+  )
 
   fun vibrate() {
     if (tm.hapticOn()) {
@@ -1915,6 +2149,7 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     selectedPages.clear()
     showDone = false
     doneFile = null
+    doneFiles = null
     pagePreviewBitmap = null
     if (selected != null) {
       scope.launch(Dispatchers.IO) {
@@ -1932,50 +2167,88 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
     }
   }
 
+  val fromInt = rangeFrom.toIntOrNull()
+  val toInt = rangeTo.toIntOrNull()
+  val rangeValid = splitMode != "Range" || (fromInt != null && toInt != null && fromInt in 1..totalPages && toInt in fromInt..totalPages)
+  val nVal = everyN.toIntOrNull() ?: 5
+  val parts: List<IntRange> = if (splitMode == "Every N" && totalPages > 0 && nVal > 0) {
+    val list = mutableListOf<IntRange>()
+    var start = 1
+    while (start <= totalPages) {
+      val end = minOf(start + nVal - 1, totalPages)
+      list.add(start..end)
+      start = end + 1
+    }
+    list
+  } else emptyList()
+  val inRange: (Int) -> Boolean = { p ->
+    when (splitMode) {
+      "Range" -> rangeValid && fromInt != null && toInt != null && p in fromInt!!..toInt!!
+      "Every N" -> parts.any { p in it }
+      else -> selectedPages.contains(p)
+    }
+  }
+
   fun split() {
     val u = pdfUri ?: return
     if (splitMode == "Selected" && selectedPages.isEmpty()) {
       Toast.makeText(ctx, "Select at least 1 page to keep", Toast.LENGTH_SHORT).show()
       return
     }
+    if (splitMode == "Range" && !rangeValid) {
+      Toast.makeText(ctx, "Check the page range first", Toast.LENGTH_SHORT).show()
+      return
+    }
+    if (splitMode == "Every N" && totalPages <= 1) {
+      Toast.makeText(ctx, "This PDF has only $totalPages page — nothing to split into parts", Toast.LENGTH_LONG).show()
+      return
+    }
     isProcessing = true
     scope.launch {
       val files = mutableListOf<File>()
+      val base = baseNameOf(ctx, u, "Split")
       withContext(Dispatchers.IO) {
         when (splitMode) {
-          "Every 5" -> {
-            var start = 1
-            while (start <= totalPages) {
-              val end = minOf(start + 4, totalPages)
-              val out = PdfEngine.outFile(ctx, "Split_${start}-${end}_${System.currentTimeMillis()}.pdf")
-              if (PdfEngine.copyPages(ctx, listOf(u to (start..end).toSet()), out)) files.add(out)
-              start = end + 1
+          "Every N" -> {
+            parts.forEachIndexed { i, range ->
+              withContext(Dispatchers.Main) { progressText = "Part ${i + 1} of ${parts.size}" }
+              val out = PdfEngine.outFile(ctx, "${base}_part${i + 1}_${System.currentTimeMillis()}.pdf")
+              if (PdfEngine.copyPages(ctx, listOf(u to range.toSet()), out)) files.add(out)
             }
           }
           "Range" -> {
-            val f = (rangeFrom.toIntOrNull() ?: 1).coerceIn(1, totalPages.coerceAtLeast(1))
-            val t = (rangeTo.toIntOrNull() ?: totalPages).coerceIn(f, totalPages.coerceAtLeast(1))
-            val out = PdfEngine.outFile(ctx, "Split_${f}-${t}_${System.currentTimeMillis()}.pdf")
+            val f = fromInt ?: 1
+            val t = toInt ?: totalPages
+            val out = PdfEngine.outFile(ctx, "${base}_${f}-${t}_${System.currentTimeMillis()}.pdf")
             if (PdfEngine.copyPages(ctx, listOf(u to (f..t).toSet()), out)) files.add(out)
           }
           else -> {
-            val out = PdfEngine.outFile(ctx, "Split_${System.currentTimeMillis()}.pdf")
+            val out = PdfEngine.outFile(ctx, "${base}_split_${System.currentTimeMillis()}.pdf")
             if (PdfEngine.copyPages(ctx, listOf(u to selectedPages.toSet()), out)) files.add(out)
           }
         }
       }
       isProcessing = false
-      if (files.isNotEmpty()) {
-        if (files.size > 1) {
-          Toast.makeText(ctx, "Created ${files.size} files — first one opens for saving", Toast.LENGTH_LONG).show()
-        }
-        launchSaveFor = files[0]
-      } else {
-        Toast.makeText(ctx, "Failed to split PDF", Toast.LENGTH_SHORT).show()
+      progressText = ""
+      when {
+        files.size > 1 -> folderSave(files.map { it to "application/pdf" })
+        files.size == 1 -> singleSave(files[0])
+        else -> Toast.makeText(ctx, "Failed to split PDF", Toast.LENGTH_SHORT).show()
       }
     }
   }
 
+  if (showDone && doneFiles != null) {
+    MultiDoneScreen(
+      files = doneFiles!!,
+      title = "PDF split",
+      summaryLines = listOf("${doneFiles!!.size} parts created.", "All parts saved to the folder you chose."),
+      theme = theme,
+      onBackHome = onBack,
+      onOpen = { ShareHelper.openFile(ctx, it, "application/pdf") }
+    )
+    return
+  }
   if (showDone && doneFile != null) {
     DoneScreen(
       file = doneFile!!,
@@ -1988,2846 +2261,168 @@ fun SplitPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
 
   ToolScreenContainer("Split PDF", theme, onBack) {
     Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Button(
-        onClick = {
-          vibrate()
-          picker.launch("application/pdf")
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text(if (pdfUri != null) "PDF ($totalPages pages) ✓" else "SELECT PDF", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-      }
+      ChamiSecondaryButton(
+        text = if (pdfUri != null) "PDF ($totalPages pages)" else "Select PDF",
+        onClick = { vibrate(); picker.launch("application/pdf") },
+        modifier = Modifier.fillMaxWidth()
+      )
 
       if (totalPages > 0) {
-        Spacer(Modifier.height(12.dp))
-        Text("SPLIT MODE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          listOf("Selected", "Range", "Every 5").forEach { m ->
-            Phase6Chip(m, splitMode == m, theme) {
-              vibrate()
-              splitMode = m
-            }
+        Spacer(Modifier.height(Ds.s16))
+        SectionText("Split mode", color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          listOf("Selected", "Range", "Every N").forEach { m ->
+            ChamiChip(m, splitMode == m, { vibrate(); splitMode = m })
           }
         }
         if (splitMode == "Range") {
-          Spacer(Modifier.height(10.dp))
-          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-              value = rangeFrom,
-              onValueChange = { rangeFrom = it.filter { ch -> ch.isDigit() } },
-              label = { Text("From page", fontFamily = PixelFont, fontSize = 10.sp) },
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+          Spacer(Modifier.height(Ds.s12))
+          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+            DebouncedTextField(
+              value = rangeFrom, onValueChange = { rangeFrom = it.filter { ch -> ch.isDigit() } },
+              label = "From page", keyboardType = KeyboardType.Number, isError = !rangeValid,
               modifier = Modifier.weight(1f)
             )
-            OutlinedTextField(
-              value = rangeTo,
-              onValueChange = { rangeTo = it.filter { ch -> ch.isDigit() } },
-              label = { Text("To page", fontFamily = PixelFont, fontSize = 10.sp) },
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            DebouncedTextField(
+              value = rangeTo, onValueChange = { rangeTo = it.filter { ch -> ch.isDigit() } },
+              label = "To page", keyboardType = KeyboardType.Number, isError = !rangeValid,
               modifier = Modifier.weight(1f)
             )
           }
+          if (!rangeValid) {
+            Spacer(Modifier.height(Ds.s4))
+            Text("Enter pages from 1 to $totalPages, From before To.", fontSize = Ds.HINT_SP.sp, color = ChamiColors.errorRed)
+          }
         }
-        Spacer(Modifier.height(12.dp))
-        Text("Pages to keep (${selectedPages.size}/$totalPages) - Tap to preview/toggle:", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-        Spacer(Modifier.height(8.dp))
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-          items((1..totalPages).toList()) { p ->
-            val isSelected = selectedPages.contains(p)
-            val isPreviewing = previewPageIndex == p
-            Box(
-              Modifier
-                .size(56.dp)
-                .clip(RoundedCornerShape(6.dp))
-                .background(if (isSelected) theme.primary else theme.card)
-                .border(if (isPreviewing) 2.dp else 0.dp, theme.primaryDark, RoundedCornerShape(6.dp))
-                .clickable {
-                  vibrate()
-                  previewPageIndex = p
-                  loadPreviewForPage(p)
-                  if (isSelected) selectedPages.remove(p) else selectedPages.add(p)
-                },
-              contentAlignment = Alignment.Center
-            ) {
-              Text(
-                text = "$p",
-                fontFamily = PixelFont,
-                fontWeight = FontWeight.Bold,
-                color = if (isSelected) theme.textOnPrimary else theme.text,
-                fontSize = 12.sp
-              )
+        if (splitMode == "Every N") {
+          Spacer(Modifier.height(Ds.s12))
+          DebouncedTextField(
+            value = everyN, onValueChange = { everyN = it.filter { ch -> ch.isDigit() } },
+            label = "Pages per part", keyboardType = KeyboardType.Number,
+            isError = nVal <= 0,
+            supportingText = if (nVal <= 0) "Enter at least 1 page per part." else null
+          )
+          if (parts.isNotEmpty()) {
+            Spacer(Modifier.height(Ds.s12))
+            Column(verticalArrangement = Arrangement.spacedBy(Ds.s4)) {
+              parts.forEachIndexed { i, range ->
+                Text(
+                  "Part ${i + 1}: pages ${range.first}–${range.last}",
+                  fontSize = Ds.BODY_SP.sp, color = theme.text
+                )
+              }
+            }
+          }
+        }
+        Spacer(Modifier.height(Ds.s16))
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+          Text(
+            "Pages (${selectedPages.size}/$totalPages)",
+            fontSize = Ds.BODY_SP.sp, fontWeight = FontWeight.SemiBold, color = theme.text
+          )
+          Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+            TextButton(onClick = { vibrate(); selectedPages.clear(); for (i in 1..totalPages) selectedPages.add(i) }, modifier = Modifier.height(Ds.minTouch)) {
+              Text("Select all", color = theme.primary, fontSize = Ds.BODY_SP.sp, fontWeight = FontWeight.SemiBold)
+            }
+            TextButton(onClick = { vibrate(); selectedPages.clear() }, modifier = Modifier.height(Ds.minTouch)) {
+              Text("Clear", color = theme.primary, fontSize = Ds.BODY_SP.sp, fontWeight = FontWeight.SemiBold)
+            }
+          }
+        }
+        Spacer(Modifier.height(Ds.s8))
+        // Page grid: tap a page to select it (tick overlay) and preview it.
+        Column(verticalArrangement = Arrangement.spacedBy(Ds.s8)) {
+          (1..totalPages).chunked(5).forEach { rowPages ->
+            Row(horizontalArrangement = Arrangement.spacedBy(Ds.s8)) {
+              rowPages.forEach { p ->
+                val isSelected = selectedPages.contains(p)
+                val highlighted = inRange(p)
+                Box(
+                  Modifier
+                    .size(Ds.minTouch)
+                    .clip(RoundedCornerShape(Ds.s8))
+                    .background(if (isSelected) theme.primary else theme.card)
+                    .border(
+                      2.dp,
+                      when {
+                        highlighted && splitMode != "Selected" -> ChamiColors.darkGreen
+                        previewPageIndex == p -> theme.primaryDark
+                        else -> theme.cardBorder
+                      },
+                      RoundedCornerShape(Ds.s8)
+                    )
+                    .clickable {
+                      vibrate()
+                      previewPageIndex = p
+                      loadPreviewForPage(p)
+                      if (isSelected) selectedPages.remove(p) else selectedPages.add(p)
+                    },
+                  contentAlignment = Alignment.Center
+                ) {
+                  Text(
+                    "$p",
+                    fontWeight = FontWeight.Bold,
+                    color = if (isSelected) theme.textOnPrimary else theme.text,
+                    fontSize = Ds.BODY_SP.sp
+                  )
+                  if (isSelected) {
+                    Icon(
+                      Icons.Filled.Check, contentDescription = "Selected",
+                      tint = theme.textOnPrimary, modifier = Modifier.align(Alignment.TopEnd).size(16.dp)
+                    )
+                  }
+                }
+              }
             }
           }
         }
 
         if (pagePreviewBitmap != null) {
-          Spacer(Modifier.height(14.dp))
-          Text("PREVIEWING PAGE $previewPageIndex:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = theme.primaryDark)
-          Spacer(Modifier.height(8.dp))
+          Spacer(Modifier.height(Ds.s16))
+          SectionText("Previewing page $previewPageIndex", color = theme.text)
+          Spacer(Modifier.height(Ds.s8))
           Column(
             modifier = Modifier
               .fillMaxWidth()
-              .clip(RoundedCornerShape(8.dp))
+              .clip(RoundedCornerShape(Ds.s8))
               .background(theme.card)
-              .padding(10.dp),
+              .padding(Ds.s12),
             horizontalAlignment = Alignment.CenterHorizontally
           ) {
             Image(
               bitmap = pagePreviewBitmap!!.asImageBitmap(),
               contentDescription = "Page $previewPageIndex",
-              modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(max = 420.dp)
-                .clip(RoundedCornerShape(6.dp)),
+              modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp).clip(RoundedCornerShape(Ds.s8)),
               contentScale = ContentScale.Fit
             )
           }
         }
+        Spacer(Modifier.height(Ds.s12))
+        HintText("Split pages are rendered as images — text in the new file is not selectable.")
       }
 
-      Spacer(Modifier.height(16.dp))
+      Spacer(Modifier.height(Ds.s16))
       if (isProcessing) {
         LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Extracting pages at 2x crisp rendering...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
+        Spacer(Modifier.height(Ds.s8))
+        Text(progressText, fontSize = Ds.HINT_SP.sp, color = theme.text)
       }
     }
 
     SlideToAction(
       label = "Slide to Split",
       theme = theme,
-      enabled = !isProcessing && pdfUri != null &&
+      enabled = !isProcessing && pdfUri != null && rangeValid &&
         (splitMode != "Selected" || selectedPages.isNotEmpty()),
-      onSlideComplete = {
-        vibrate()
-        split()
-      }
+      onSlideComplete = { vibrate(); split() }
     )
   }
 }
 
-// 5. MERGE PDF — Phase 6 extras: reorder the selected PDFs before merging
-// (up/down buttons per file — chosen over long-press drag so the order is
-// exact and unambiguous) + first-page thumbnail preview of each file.
-// Picker appends instead of replacing, so files can be added in batches.
-@Composable
-fun MergePdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-  var pdfUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
-  var pdfPreviews by remember { mutableStateOf<List<Pair<Int, Bitmap?>>>(emptyList()) }
-  var previewJob by remember { mutableStateOf<Job?>(null) }
-  var isProcessing by remember { mutableStateOf(false) }
-
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  fun refreshPreviews(uris: List<Uri>) {
-    // Cancel any in-flight refresh and only apply the result if the
-    // file list has not changed since — otherwise a stale completion
-    // overwrites a reorder/remove (H10).
-    previewJob?.cancel()
-    previewJob = scope.launch(Dispatchers.IO) {
-      val previews = uris.map { u ->
-        val count = PdfEngine.pageCount(ctx, u)
-        val bmp = PdfReader.renderPageBitmap(ctx, u, 0, 1.5f)
-        Pair(count, bmp)
-      }
-      withContext(Dispatchers.Main) {
-        if (pdfUris == uris) pdfPreviews = previews
-      }
-    }
-  }
-
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selected ->
-    if (selected.isNotEmpty()) {
-      showDone = false
-      doneFile = null
-      val combined = pdfUris + selected
-      pdfUris = combined
-      refreshPreviews(combined)
-    }
-  }
-
-  fun moveFile(from: Int, to: Int) {
-    if (from !in pdfUris.indices || to !in pdfUris.indices) return
-    val m = pdfUris.toMutableList()
-    val item = m.removeAt(from)
-    m.add(to, item)
-    pdfUris = m
-    val p = pdfPreviews.toMutableList()
-    if (from in p.indices && to in p.indices) {
-      val pi = p.removeAt(from)
-      p.add(to, pi)
-      pdfPreviews = p
-    }
-  }
-
-  fun merge() {
-    if (pdfUris.size < 2) {
-      Toast.makeText(ctx, "Select at least 2 PDFs to merge", Toast.LENGTH_SHORT).show()
-      return
-    }
-    isProcessing = true
-    scope.launch {
-      val out = PdfEngine.outFile(ctx, "Merged_${System.currentTimeMillis()}.pdf")
-      val sources = pdfUris.map { it to null }
-      val ok = withContext(Dispatchers.IO) {
-        PdfEngine.copyPages(ctx, sources, out)
-      }
-      isProcessing = false
-      if (ok) launchSaveFor = out
-      else Toast.makeText(ctx, "Failed to merge PDFs", Toast.LENGTH_SHORT).show()
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, "application/pdf") }
-    )
-    return
-  }
-
-  ToolScreenContainer("Merge PDF", theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Button(
-        onClick = {
-          vibrate()
-          picker.launch("application/pdf")
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text("CHOOSE PDFS (${pdfUris.size} selected)", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-      }
-
-      if (pdfPreviews.isNotEmpty()) {
-        Spacer(Modifier.height(14.dp))
-        val totalCombinedPages = pdfPreviews.sumOf { it.first }
-        Text("PREVIEW: $totalCombinedPages TOTAL PAGES COMBINED", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(8.dp))
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-          pdfPreviews.forEachIndexed { index, pair ->
-            Row(
-              Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .background(theme.card)
-                .padding(8.dp),
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              pair.second?.let { bmp ->
-                Image(
-                  bitmap = bmp.asImageBitmap(),
-                  contentDescription = "PDF ${index + 1}",
-                  modifier = Modifier
-                    .size(72.dp)
-                    .clip(RoundedCornerShape(4.dp)),
-                  contentScale = ContentScale.Fit
-                )
-              }
-              Spacer(Modifier.width(10.dp))
-              Column(Modifier.weight(1f)) {
-                Text("Doc ${index + 1}", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text, fontWeight = FontWeight.Bold)
-                Text("${pair.first} pages", fontFamily = PixelFont, fontSize = 10.sp, color = theme.textSecondary)
-              }
-              Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                TextButton(
-                  onClick = {
-                    vibrate()
-                    moveFile(index, index - 1)
-                  },
-                  enabled = index > 0,
-                  contentPadding = PaddingValues(4.dp)
-                ) {
-                  Text("↑", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = theme.text)
-                }
-                TextButton(
-                  onClick = {
-                    vibrate()
-                    moveFile(index, index + 1)
-                  },
-                  enabled = index < pdfUris.lastIndex,
-                  contentPadding = PaddingValues(4.dp)
-                ) {
-                  Text("↓", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = theme.text)
-                }
-              }
-              TextButton(
-                onClick = {
-                  vibrate()
-                  val m = pdfUris.toMutableList()
-                  m.removeAt(index)
-                  pdfUris = m
-                  refreshPreviews(m)
-                },
-                contentPadding = PaddingValues(4.dp)
-              ) {
-                Text("✕", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = theme.textSecondary)
-              }
-            }
-          }
-        }
-      }
-
-      Spacer(Modifier.height(16.dp))
-      if (isProcessing) {
-        LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Merging PDF pages on IO thread...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-      }
-    }
-
-    SlideToAction(
-      label = "Slide to Merge",
-      theme = theme,
-      enabled = !isProcessing && pdfUris.size >= 2,
-      onSlideComplete = {
-        vibrate()
-        merge()
-      }
-    )
-  }
-}
-
-// 6. COMPRESS KB (DUAL TAB: IMAGE / PDF) — Phase 6 extras: PDF tab gets a
-// quality slider (0-100) mapped onto the existing PdfCompress presets
-// (see compressPdfWithQuality — the compressor re-renders pages as images,
-// so text is rasterised; no image-only re-encode helper exists). Slide to
-// Compress on both tabs, then save picker + DoneScreen. NO ads.
-@Composable
-fun CompressKbScreen(theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-
-  var selectedTab by remember { mutableStateOf(0) } // 0: IMAGE, 1: PDF
-
-  // --- IMAGE TAB STATE ---
-  var imageUri by remember { mutableStateOf<Uri?>(null) }
-  var imageBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var imageOrigKb by remember { mutableStateOf(0L) }
-  var targetKb by remember { mutableStateOf(200) }
-  var isCustomKb by remember { mutableStateOf(false) }
-  var customInput by remember { mutableStateOf("150") }
-  var isImageProcessing by remember { mutableStateOf(false) }
-
-  // --- PDF TAB STATE ---
-  var pdfUri by remember { mutableStateOf<Uri?>(null) }
-  var pdfOrigBytes by remember { mutableStateOf(0L) }
-  var pdfTotalPages by remember { mutableStateOf(0) }
-  var pdfPreviewBmp by remember { mutableStateOf<Bitmap?>(null) }
-  var pdfQuality by remember { mutableStateOf(50) }
-  var isPdfProcessing by remember { mutableStateOf(false) }
-  var pdfProgressText by remember { mutableStateOf("") }
-  var pdfResultKb by remember { mutableStateOf(0L) }
-
-  // After-convert flow (two mimes: image + pdf).
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var doneMime by remember { mutableStateOf("application/pdf") }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSavePdfFor by remember { mutableStateOf<File?>(null) }
-  var launchSaveImgFor by remember { mutableStateOf<File?>(null) }
-  val pdfSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          doneMime = "application/pdf"
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  val imgSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          doneMime = "image/jpeg"
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSavePdfFor) {
-    val f = launchSavePdfFor
-    if (f != null) {
-      pendingSaveFile = f
-      pdfSaveLauncher.launch(f.name)
-      launchSavePdfFor = null
-    }
-  }
-  LaunchedEffect(launchSaveImgFor) {
-    val f = launchSaveImgFor
-    if (f != null) {
-      pendingSaveFile = f
-      imgSaveLauncher.launch(f.name)
-      launchSaveImgFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    imageUri = selected
-    showDone = false
-    doneFile = null
-    imageBitmap = null
-    if (selected != null) {
-      scope.launch(Dispatchers.IO) {
-        val bmp = PdfEngine.loadBitmap(ctx, selected, 1200)
-        var size = 0L
-        try {
-          ctx.contentResolver.openInputStream(selected)?.use { size = it.available() / 1024L }
-        } catch (_: Exception) {}
-        withContext(Dispatchers.Main) {
-          imageBitmap = bmp
-          imageOrigKb = size
-        }
-      }
-    }
-  }
-
-  val pdfPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    pdfUri = selected
-    showDone = false
-    doneFile = null
-    pdfPreviewBmp = null
-    pdfResultKb = 0L
-    if (selected != null) {
-      scope.launch(Dispatchers.IO) {
-        val bytes = PdfCompress.originalSizeBytes(ctx, selected)
-        val pages = PdfEngine.pageCount(ctx, selected)
-        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 1.5f)
-        withContext(Dispatchers.Main) {
-          pdfOrigBytes = bytes
-          pdfTotalPages = pages
-          pdfPreviewBmp = bmp
-        }
-      }
-    }
-  }
-
-  fun compressImage() {
-    val u = imageUri ?: return
-    isImageProcessing = true
-    scope.launch {
-      val out = PdfEngine.outFile(ctx, "Compress_${targetKb}KB_${System.currentTimeMillis()}.jpg")
-      val ok = withContext(Dispatchers.IO) {
-        PdfEngine.compressImageToKb(ctx, u, targetKb, out)
-      }
-      isImageProcessing = false
-      if (ok) launchSaveImgFor = out
-      else Toast.makeText(ctx, "Compression failed", Toast.LENGTH_SHORT).show()
-    }
-  }
-
-  fun compressPdf() {
-    val u = pdfUri ?: return
-    isPdfProcessing = true
-    pdfProgressText = "Compressing PDF pages..."
-    scope.launch {
-      val out = PdfEngine.outFile(ctx, "Compressed_${System.currentTimeMillis()}.pdf")
-      val res = withContext(Dispatchers.IO) {
-        compressPdfWithQuality(ctx, u, pdfQuality, out)
-      }
-      isPdfProcessing = false
-      if (res.ok) {
-        pdfResultKb = res.outKb
-        launchSavePdfFor = out
-      } else {
-        Toast.makeText(ctx, "PDF compression failed", Toast.LENGTH_SHORT).show()
-      }
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, doneMime) }
-    )
-    return
-  }
-
-  ToolScreenContainer("Compress KB", theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      // TAB BAR
-      Row(
-        modifier = Modifier
-          .fillMaxWidth()
-          .clip(RoundedCornerShape(8.dp))
-          .background(theme.card)
-          .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
-      ) {
-        Box(
-          modifier = Modifier
-            .weight(1f)
-            .height(40.dp)
-            .clip(RoundedCornerShape(6.dp))
-            .background(if (selectedTab == 0) theme.primary else Color.Transparent)
-            .clickable {
-              vibrate()
-              selectedTab = 0
-            },
-          contentAlignment = Alignment.Center
-        ) {
-          Text(
-            "COMPRESS IMAGE",
-            fontFamily = PixelFont,
-            fontWeight = FontWeight.Bold,
-            fontSize = 11.sp,
-            color = if (selectedTab == 0) Color.White else theme.text
-          )
-        }
-        Box(
-          modifier = Modifier
-            .weight(1f)
-            .height(40.dp)
-            .clip(RoundedCornerShape(6.dp))
-            .background(if (selectedTab == 1) theme.primary else Color.Transparent)
-            .clickable {
-              vibrate()
-              selectedTab = 1
-            },
-          contentAlignment = Alignment.Center
-        ) {
-          Text(
-            "COMPRESS PDF",
-            fontFamily = PixelFont,
-            fontWeight = FontWeight.Bold,
-            fontSize = 11.sp,
-            color = if (selectedTab == 1) Color.White else theme.text
-          )
-        }
-      }
-
-      Spacer(Modifier.height(14.dp))
-
-      if (selectedTab == 0) {
-        // IMAGE TAB CONTENT
-        PrimaryButton(
-          theme = theme,
-          text = if (imageUri != null) "IMAGE CHOSEN ✓" else "SELECT IMAGE",
-          height = 48.dp,
-          onClick = {
-            vibrate()
-            imagePicker.launch("image/*")
-          }
-        )
-
-        if (imageBitmap != null) {
-          Spacer(Modifier.height(14.dp))
-          Text("ORIGINAL IMAGE PREVIEW:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-          Spacer(Modifier.height(6.dp))
-          Column(
-            modifier = Modifier
-              .fillMaxWidth()
-              .clip(RoundedCornerShape(8.dp))
-              .background(theme.card)
-              .padding(10.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-          ) {
-            Image(
-              bitmap = imageBitmap!!.asImageBitmap(),
-              contentDescription = "Original Preview",
-              modifier = Modifier
-                .fillMaxWidth()
-                .height(320.dp)
-                .clip(RoundedCornerShape(6.dp)),
-              contentScale = ContentScale.Fit
-            )
-            Spacer(Modifier.height(8.dp))
-            Text("Current Size: ${if (imageOrigKb > 0) "$imageOrigKb KB" else "Ready"}", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text, fontWeight = FontWeight.Bold)
-            Text("Target: $targetKb KB", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark)
-          }
-        }
-
-        Spacer(Modifier.height(14.dp))
-        Text("Target Size Preset:", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-        Spacer(Modifier.height(8.dp))
-
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-          listOf(50, 100, 200, 500).forEach { kb ->
-            val isSelected = !isCustomKb && targetKb == kb
-            Box(
-              Modifier
-                .weight(1f)
-                .height(44.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(if (isSelected) theme.primary else theme.card)
-                .clickable {
-                  vibrate()
-                  isCustomKb = false
-                  targetKb = kb
-                },
-              contentAlignment = Alignment.Center
-            ) {
-              Text("$kb KB", fontFamily = PixelFont, color = if (isSelected) Color.White else theme.text, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            }
-          }
-          Box(
-            Modifier
-              .weight(1.2f)
-              .height(44.dp)
-              .clip(RoundedCornerShape(8.dp))
-              .background(if (isCustomKb) theme.primary else theme.card)
-              .clickable {
-                vibrate()
-                isCustomKb = true
-                val c = customInput.toIntOrNull() ?: 150
-                targetKb = c.coerceAtLeast(10)
-              },
-            contentAlignment = Alignment.Center
-          ) {
-            Text("CUSTOM", fontFamily = PixelFont, color = if (isCustomKb) Color.White else theme.text, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-          }
-        }
-
-        if (isCustomKb) {
-          Spacer(Modifier.height(12.dp))
-          OutlinedTextField(
-            value = customInput,
-            onValueChange = {
-              customInput = it.filter { ch -> ch.isDigit() }
-              val c = customInput.toIntOrNull()
-              if (c != null && c > 0) targetKb = c
-            },
-            label = { Text("Enter Target KB (e.g. 75, 150, 350)", fontFamily = PixelFont, fontSize = 10.sp) },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth()
-          )
-        }
-
-        Spacer(Modifier.height(16.dp))
-        if (isImageProcessing) {
-          LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-          Spacer(Modifier.height(8.dp))
-          Text("Compressing to hit ${targetKb}KB...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-        }
-      } else {
-        // PDF TAB CONTENT
-        PrimaryButton(
-          theme = theme,
-          text = if (pdfUri != null) "PDF SELECTED ($pdfTotalPages PAGES) ✓" else "SELECT PDF",
-          height = 48.dp,
-          onClick = {
-            vibrate()
-            pdfPicker.launch("application/pdf")
-          }
-        )
-
-        if (pdfUri != null) {
-          Spacer(Modifier.height(14.dp))
-          Row(
-            modifier = Modifier
-              .fillMaxWidth()
-              .clip(RoundedCornerShape(8.dp))
-              .background(theme.card)
-              .padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically
-          ) {
-            pdfPreviewBmp?.let { bmp ->
-              Image(
-                bitmap = bmp.asImageBitmap(),
-                contentDescription = "PDF Preview",
-                modifier = Modifier
-                  .size(120.dp)
-                  .clip(RoundedCornerShape(6.dp)),
-                contentScale = ContentScale.Fit
-              )
-              Spacer(Modifier.width(12.dp))
-            }
-            Column {
-              val kb = pdfOrigBytes / 1024L
-              val mb = kb / 1024f
-              val sizeText = if (mb >= 1.0f) String.format("%.2f MB (%d KB)", mb, kb) else "$kb KB"
-              Text("Original Size: $sizeText", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text, fontWeight = FontWeight.Bold)
-              Text("Total Pages: $pdfTotalPages", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark)
-            }
-          }
-
-          Spacer(Modifier.height(14.dp))
-          Text("Quality: $pdfQuality", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = theme.text)
-          Text("Lower quality = smaller file. 70+ High, 40–69 Medium, under 40 Maximum.", fontFamily = PixelFont, fontSize = 10.sp, color = theme.textSecondary)
-          Slider(
-            value = pdfQuality.toFloat(),
-            onValueChange = { pdfQuality = it.toInt() },
-            valueRange = 0f..100f,
-            colors = SliderDefaults.colors(thumbColor = theme.primary, activeTrackColor = theme.primary)
-          )
-          Text("Pages are re-encoded as images to shrink the file.", fontFamily = PixelFont, fontSize = 10.sp, color = theme.textSecondary)
-          if (pdfResultKb > 0) {
-            Spacer(Modifier.height(8.dp))
-            val oldKb = pdfOrigBytes / 1024L
-            val savedPct = if (oldKb > 0) ((oldKb - pdfResultKb) * 100 / oldKb).coerceAtLeast(0) else 0
-            Text("Last result: ${oldKb}KB → ${pdfResultKb}KB (Saved ${savedPct}%)", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text, fontWeight = FontWeight.Bold)
-          }
-        }
-
-        Spacer(Modifier.height(16.dp))
-        if (isPdfProcessing) {
-          LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-          Spacer(Modifier.height(8.dp))
-          Text(if (pdfProgressText.isNotEmpty()) pdfProgressText else "Compressing PDF pages...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-        }
-      }
-    }
-
-    if (selectedTab == 0) {
-      SlideToAction(
-        label = "Slide to Compress",
-        theme = theme,
-        enabled = !isImageProcessing && imageUri != null,
-        onSlideComplete = {
-          vibrate()
-          compressImage()
-        }
-      )
-    } else {
-      SlideToAction(
-        label = "Slide to Compress",
-        theme = theme,
-        enabled = !isPdfProcessing && pdfUri != null,
-        onSlideComplete = {
-          vibrate()
-          compressPdf()
-        }
-      )
-    }
-  }
-}
-
-// 7. PASSPORT PHOTO — Slide to Generate, then save picker + DoneScreen.
-// NO ads.
-@Composable
-fun PassportPhotoScreen(theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-  var imageUri by remember { mutableStateOf<Uri?>(null) }
-  var passportPreviewBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var is8UpSheet by remember { mutableStateOf(false) }
-  var isProcessing by remember { mutableStateOf(false) }
-
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var doneMime by remember { mutableStateOf("image/jpeg") }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSavePdfFor by remember { mutableStateOf<File?>(null) }
-  var launchSaveImgFor by remember { mutableStateOf<File?>(null) }
-  val pdfSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          doneMime = "application/pdf"
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  val imgSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          doneMime = "image/jpeg"
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSavePdfFor) {
-    val f = launchSavePdfFor
-    if (f != null) {
-      pendingSaveFile = f
-      pdfSaveLauncher.launch(f.name)
-      launchSavePdfFor = null
-    }
-  }
-  LaunchedEffect(launchSaveImgFor) {
-    val f = launchSaveImgFor
-    if (f != null) {
-      pendingSaveFile = f
-      imgSaveLauncher.launch(f.name)
-      launchSaveImgFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    imageUri = selected
-    showDone = false
-    doneFile = null
-    passportPreviewBitmap = null
-    if (selected != null) {
-      scope.launch(Dispatchers.IO) {
-        val raw = PdfEngine.loadBitmap(ctx, selected, 1000)
-        if (raw != null) {
-          val side = minOf(raw.width, raw.height)
-          val cropped = Bitmap.createBitmap(raw, (raw.width - side) / 2, (raw.height - side) / 2, side, side)
-          val out = Bitmap.createBitmap(413, 531, Bitmap.Config.ARGB_8888)
-          val c = Canvas(out)
-          c.drawColor(AndroidColor.WHITE)
-          c.drawBitmap(cropped, null, Rect(0, 0, 413, 531), null)
-          raw.recycle()
-          cropped.recycle()
-          withContext(Dispatchers.Main) { passportPreviewBitmap = out }
-        }
-      }
-    }
-  }
-
-  fun generate() {
-    val u = imageUri ?: return
-    isProcessing = true
-    scope.launch {
-      val singleOut = PdfEngine.outFile(ctx, "Passport_${System.currentTimeMillis()}.jpg")
-      val ok = withContext(Dispatchers.IO) {
-        PdfEngine.passportPhoto(ctx, u, singleOut)
-      }
-      if (ok) {
-        if (is8UpSheet) {
-          val sheetOut = PdfEngine.outFile(ctx, "Passport_Sheet8_${System.currentTimeMillis()}.pdf")
-          val sheetOk = withContext(Dispatchers.IO) {
-            PdfEngine.passportPhotoSheet8(ctx, singleOut, sheetOut)
-          }
-          if (sheetOk) launchSavePdfFor = sheetOut
-          else Toast.makeText(ctx, "Failed to create 8-up sheet", Toast.LENGTH_SHORT).show()
-        } else {
-          launchSaveImgFor = singleOut
-        }
-      } else {
-        Toast.makeText(ctx, "Failed to create passport photo", Toast.LENGTH_SHORT).show()
-      }
-      isProcessing = false
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, doneMime) }
-    )
-    return
-  }
-
-  ToolScreenContainer("Passport Photo", theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Button(
-        onClick = {
-          vibrate()
-          picker.launch("image/*")
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text(if (imageUri != null) "PHOTO SELECTED ✓" else "SELECT PHOTO", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-      }
-
-      if (passportPreviewBitmap != null) {
-        Spacer(Modifier.height(14.dp))
-        Text("PASSPORT PHOTO PREVIEW (35x45mm):", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(8.dp))
-        Column(
-          modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card)
-            .padding(12.dp),
-          horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-          Image(
-            bitmap = passportPreviewBitmap!!.asImageBitmap(),
-            contentDescription = "Passport Preview",
-            modifier = Modifier
-              .width(138.dp)
-              .height(177.dp)
-              .clip(RoundedCornerShape(4.dp))
-              .border(1.dp, Color.LightGray, RoundedCornerShape(4.dp)),
-            contentScale = ContentScale.Fit
-          )
-          Spacer(Modifier.height(6.dp))
-          Text(if (is8UpSheet) "Will print 8 copies on A4 PDF" else "Single high-res 300dpi JPEG", fontFamily = PixelFont, fontSize = 10.sp, color = theme.text)
-        }
-      }
-
-      Spacer(Modifier.height(14.dp))
-      Text("Output Format:", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-      Spacer(Modifier.height(8.dp))
-      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Box(
-          Modifier
-            .weight(1f)
-            .height(44.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (!is8UpSheet) theme.primary else theme.card)
-            .clickable {
-              vibrate()
-              is8UpSheet = false
-            },
-          contentAlignment = Alignment.Center
-        ) {
-          Text("Single Photo", fontFamily = PixelFont, color = if (!is8UpSheet) theme.textOnPrimary else theme.text, fontSize = 12.sp)
-        }
-        Box(
-          Modifier
-            .weight(1f)
-            .height(44.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (is8UpSheet) theme.primary else theme.card)
-            .clickable {
-              vibrate()
-              is8UpSheet = true
-            },
-          contentAlignment = Alignment.Center
-        ) {
-          Text("8-Up A4 PDF", fontFamily = PixelFont, color = if (is8UpSheet) theme.textOnPrimary else theme.text, fontSize = 12.sp)
-        }
-      }
-
-      Spacer(Modifier.height(16.dp))
-      if (isProcessing) {
-        LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-      }
-    }
-
-    SlideToAction(
-      label = if (is8UpSheet) "Slide to Generate Sheet" else "Slide to Generate Photo",
-      theme = theme,
-      enabled = !isProcessing && imageUri != null,
-      onSlideComplete = {
-        vibrate()
-        generate()
-      }
-    )
-  }
-}
-
-// 8. IMAGE RESIZER & FORMAT CONVERT — Phase 6 extras: preset sizes
-// (WhatsApp / Instagram / Passport / A4) and resize to an exact KB target
-// (JPG only, via PdfEngine.compressImageToKb). When this screen is opened
-// as "Format Convert" it is a batch tool: multi-select, convert all, live
-// progress count. Slide to Resize / Convert, then save picker + DoneScreen.
-@Composable
-fun ResizeConvertScreen(theme: ChamiTheme, title: String = "Image Resizer", onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-  val isBatch = title == "Format Convert"
-  var imageUri by remember { mutableStateOf<Uri?>(null) }
-  var imageUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
-  var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var origDimensions by remember { mutableStateOf<Pair<Int, Int>?>(null) }
-  var widthStr by remember { mutableStateOf("800") }
-  var heightStr by remember { mutableStateOf("800") }
-  var formatChoice by remember { mutableStateOf("JPG") }
-  var targetKbStr by remember { mutableStateOf("") }
-  var isProcessing by remember { mutableStateOf(false) }
-  var batchProgress by remember { mutableStateOf(0) }
-  var batchTotal by remember { mutableStateOf(0) }
-
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var doneMime by remember { mutableStateOf("image/jpeg") }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/*")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    imageUri = selected
-    showDone = false
-    doneFile = null
-    previewBitmap = null
-    if (selected != null) {
-      scope.launch(Dispatchers.IO) {
-        val bmp = PdfEngine.loadBitmap(ctx, selected, 1200)
-        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        try {
-          ctx.contentResolver.openInputStream(selected)?.use { BitmapFactory.decodeStream(it, null, opts) }
-        } catch (_: Exception) {}
-        withContext(Dispatchers.Main) {
-          previewBitmap = bmp
-          if (opts.outWidth > 0 && opts.outHeight > 0) {
-            origDimensions = Pair(opts.outWidth, opts.outHeight)
-            widthStr = "${opts.outWidth / 2}"
-            heightStr = "${opts.outHeight / 2}"
-          }
-        }
-      }
-    }
-  }
-
-  val batchPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { selected ->
-    if (selected.isNotEmpty()) {
-      imageUris = imageUris + selected
-      showDone = false
-      doneFile = null
-      batchProgress = 0
-      val first = selected.firstOrNull()
-      if (first != null && previewBitmap == null) {
-        scope.launch(Dispatchers.IO) {
-          val bmp = PdfEngine.loadBitmap(ctx, first, 1200)
-          withContext(Dispatchers.Main) { previewBitmap = bmp }
-        }
-      }
-    }
-  }
-
-  fun convertSingle() {
-    val u = imageUri ?: return
-    val w = (widthStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
-    val h = (heightStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
-    val format = when (formatChoice) {
-      "PNG" -> Bitmap.CompressFormat.PNG
-      "WEBP" -> Bitmap.CompressFormat.WEBP
-      else -> Bitmap.CompressFormat.JPEG
-    }
-    val ext = formatChoice.lowercase()
-    val kbTarget = targetKbStr.toIntOrNull()
-    isProcessing = true
-    scope.launch {
-      val tmp = PdfEngine.outFile(ctx, "Resized_${w}x${h}_${System.currentTimeMillis()}.$ext")
-      val ok = withContext(Dispatchers.IO) {
-        PdfEngine.resizeConvert(ctx, u, w, h, format, tmp)
-      }
-      var finalFile = tmp
-      if (ok && kbTarget != null && kbTarget > 0) {
-        if (formatChoice == "JPG") {
-          val out2 = PdfEngine.outFile(ctx, "Resized_${kbTarget}KB_${System.currentTimeMillis()}.jpg")
-          val ok2 = withContext(Dispatchers.IO) {
-            PdfEngine.compressImageToKb(ctx, Uri.fromFile(tmp), kbTarget, out2)
-          }
-          if (ok2) finalFile = out2
-        } else {
-          withContext(Dispatchers.Main) {
-            Toast.makeText(ctx, "Exact KB target works with JPG — saved at chosen size instead", Toast.LENGTH_LONG).show()
-          }
-        }
-      }
-      isProcessing = false
-      if (ok) {
-        doneMime = if (formatChoice == "PNG") "image/png" else if (formatChoice == "WEBP") "image/webp" else "image/jpeg"
-        launchSaveFor = finalFile
-      } else {
-        Toast.makeText(ctx, "Failed to resize", Toast.LENGTH_SHORT).show()
-      }
-    }
-  }
-
-  fun convertBatch() {
-    if (imageUris.isEmpty()) return
-    val w = (widthStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
-    val h = (heightStr.toIntOrNull() ?: 800).coerceIn(1, 4096)
-    val format = when (formatChoice) {
-      "PNG" -> Bitmap.CompressFormat.PNG
-      "WEBP" -> Bitmap.CompressFormat.WEBP
-      else -> Bitmap.CompressFormat.JPEG
-    }
-    val ext = formatChoice.lowercase()
-    isProcessing = true
-    batchTotal = imageUris.size
-    batchProgress = 0
-    scope.launch {
-      var first: File? = null
-      var done = 0
-      for ((idx, u) in imageUris.withIndex()) {
-        val out = PdfEngine.outFile(ctx, "Converted_${idx + 1}_${System.currentTimeMillis()}.$ext")
-        val ok = withContext(Dispatchers.IO) {
-          PdfEngine.resizeConvert(ctx, u, w, h, format, out)
-        }
-        if (ok) {
-          if (first == null) first = out
-          done++
-        }
-        batchProgress = done
-      }
-      isProcessing = false
-      if (first != null) {
-        doneMime = if (formatChoice == "PNG") "image/png" else if (formatChoice == "WEBP") "image/webp" else "image/jpeg"
-        Toast.makeText(ctx, "Converted $done of ${imageUris.size} files — first one opens for saving", Toast.LENGTH_LONG).show()
-        launchSaveFor = first
-      } else {
-        Toast.makeText(ctx, "Failed to convert files", Toast.LENGTH_SHORT).show()
-      }
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, doneMime) }
-    )
-    return
-  }
-
-  ToolScreenContainer(title, theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      if (isBatch) {
-        PrimaryButton(
-          theme = theme,
-          text = if (imageUris.isNotEmpty()) "${imageUris.size} IMAGES CHOSEN ✓" else "SELECT IMAGES",
-          height = 48.dp,
-          onClick = {
-            vibrate()
-            batchPicker.launch("image/*")
-          }
-        )
-        if (imageUris.isNotEmpty()) {
-          Spacer(Modifier.height(10.dp))
-          Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            imageUris.forEachIndexed { i, uri ->
-              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                  "${i + 1}. ${uri.lastPathSegment ?: "image"}",
-                  fontFamily = PixelFont, fontSize = 11.sp, color = theme.text,
-                  modifier = Modifier.weight(1f), maxLines = 1
-                )
-                TextButton(
-                  onClick = {
-                    vibrate()
-                    imageUris = imageUris.filterIndexed { idx, _ -> idx != i }
-                  },
-                  contentPadding = PaddingValues(4.dp)
-                ) {
-                  Text("✕", fontSize = 12.sp, color = theme.textSecondary)
-                }
-              }
-            }
-          }
-          if (isProcessing || batchProgress > 0) {
-            Spacer(Modifier.height(6.dp))
-            Text("Converted $batchProgress / $batchTotal", fontFamily = PixelFont, fontSize = 11.sp, color = theme.primaryDark, fontWeight = FontWeight.Bold)
-          }
-        }
-      } else {
-        PrimaryButton(
-          theme = theme,
-          text = if (imageUri != null) "IMAGE LOADED ✓" else "SELECT IMAGE",
-          height = 48.dp,
-          onClick = {
-            vibrate()
-            picker.launch("image/*")
-          }
-        )
-      }
-
-      if (previewBitmap != null) {
-        Spacer(Modifier.height(14.dp))
-        Text("IMAGE PREVIEW:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Column(
-          modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card)
-            .padding(10.dp),
-          horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-          Image(
-            bitmap = previewBitmap!!.asImageBitmap(),
-            contentDescription = "Resize Preview",
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(320.dp)
-              .clip(RoundedCornerShape(6.dp)),
-            contentScale = ContentScale.Fit
-          )
-          Spacer(Modifier.height(8.dp))
-          origDimensions?.let { (w, h) ->
-            Text("Original: ${w}x$h px", fontFamily = PixelFont, fontSize = 10.sp, color = theme.text)
-          }
-          Text("Target: ${widthStr}x${heightStr} px ($formatChoice)", fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark, fontWeight = FontWeight.Bold)
-        }
-      }
-
-      Spacer(Modifier.height(14.dp))
-      Text("PRESETS", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-      Spacer(Modifier.height(6.dp))
-      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf(
-          "WhatsApp" to ("1080" to "1080"),
-          "Instagram" to ("1080" to "1350"),
-          "Passport" to ("413" to "531"),
-          "A4" to ("1240" to "1754")
-        ).forEach { (label, wh) ->
-          val isSel = widthStr == wh.first && heightStr == wh.second
-          Phase6Chip(label, isSel, theme) {
-            vibrate()
-            widthStr = wh.first
-            heightStr = wh.second
-          }
-        }
-      }
-
-      Spacer(Modifier.height(14.dp))
-      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedTextField(
-          value = widthStr,
-          onValueChange = { widthStr = it.filter { ch -> ch.isDigit() } },
-          label = { Text("Width (px)", fontFamily = PixelFont, fontSize = 10.sp) },
-          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-          modifier = Modifier.weight(1f)
-        )
-        OutlinedTextField(
-          value = heightStr,
-          onValueChange = { heightStr = it.filter { ch -> ch.isDigit() } },
-          label = { Text("Height (px)", fontFamily = PixelFont, fontSize = 10.sp) },
-          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-          modifier = Modifier.weight(1f)
-        )
-      }
-
-      Spacer(Modifier.height(14.dp))
-      Text("Format:", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-      Spacer(Modifier.height(8.dp))
-      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        listOf("JPG", "PNG", "WEBP").forEach { fmt ->
-          val isSelected = formatChoice == fmt
-          Box(
-            Modifier
-              .weight(1f)
-              .height(44.dp)
-              .clip(RoundedCornerShape(8.dp))
-              .background(if (isSelected) theme.primary else theme.card)
-              .clickable {
-                vibrate()
-                formatChoice = fmt
-              },
-            contentAlignment = Alignment.Center
-          ) {
-            Text(fmt, fontFamily = PixelFont, color = if (isSelected) theme.textOnPrimary else theme.text, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-          }
-        }
-      }
-
-      if (!isBatch) {
-        Spacer(Modifier.height(14.dp))
-        OutlinedTextField(
-          value = targetKbStr,
-          onValueChange = { targetKbStr = it.filter { ch -> ch.isDigit() } },
-          label = { Text("Exact size target in KB (JPG only, optional)", fontFamily = PixelFont, fontSize = 10.sp) },
-          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-          modifier = Modifier.fillMaxWidth()
-        )
-      }
-
-      Spacer(Modifier.height(16.dp))
-      if (isProcessing) {
-        LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-      }
-    }
-
-    if (isBatch) {
-      SlideToAction(
-        label = "Slide to Convert All",
-        theme = theme,
-        enabled = !isProcessing && imageUris.isNotEmpty(),
-        onSlideComplete = {
-          vibrate()
-          convertBatch()
-        }
-      )
-    } else {
-      SlideToAction(
-        label = "Slide to Resize",
-        theme = theme,
-        enabled = !isProcessing && imageUri != null,
-        onSlideComplete = {
-          vibrate()
-          convertSingle()
-        }
-      )
-    }
-  }
-}
-
-// 9. OCR TEXT — Phase 6 extras: text language choice (English / Hindi /
-// Spanish / French / German) and export as TXT or searchable PDF.
-// NOTE: OcrHelper.ocrImage(ctx, uri) takes no language parameter, so the
-// language is stored with the export (file name + PDF title) — the
-// on-device recogniser reads Latin script. Export is a real file: TXT via
-// saveTextToFile, searchable PDF (real selectable text) via textToPdf.
-@Composable
-fun OcrScreen(theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-  var imageUri by remember { mutableStateOf<Uri?>(null) }
-  var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var isProcessing by remember { mutableStateOf(false) }
-  var extractedText by remember { mutableStateOf("") }
-  var ocrLang by remember { mutableStateOf("English") }
-
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var doneMime by remember { mutableStateOf("text/plain") }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSaveTxtFor by remember { mutableStateOf<File?>(null) }
-  var launchSavePdfFor by remember { mutableStateOf<File?>(null) }
-  val txtSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          doneMime = "text/plain"
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  val pdfSaveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          doneMime = "application/pdf"
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveTxtFor) {
-    val f = launchSaveTxtFor
-    if (f != null) {
-      pendingSaveFile = f
-      txtSaveLauncher.launch(f.name)
-      launchSaveTxtFor = null
-    }
-  }
-  LaunchedEffect(launchSavePdfFor) {
-    val f = launchSavePdfFor
-    if (f != null) {
-      pendingSaveFile = f
-      pdfSaveLauncher.launch(f.name)
-      launchSavePdfFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    imageUri = selected
-    extractedText = ""
-    showDone = false
-    doneFile = null
-    previewBitmap = null
-    if (selected != null) {
-      scope.launch(Dispatchers.IO) {
-        val bmp = PdfEngine.loadBitmap(ctx, selected, 1200)
-        withContext(Dispatchers.Main) { previewBitmap = bmp }
-      }
-    }
-  }
-
-  fun runOcr() {
-    val u = imageUri ?: return
-    isProcessing = true
-    scope.launch {
-      val txt = withContext(Dispatchers.IO) {
-        ocrImage(ctx, u)
-      }
-      isProcessing = false
-      extractedText = if (txt.isBlank()) "[No readable text found in image]" else txt
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, doneMime) }
-    )
-    return
-  }
-
-  ToolScreenContainer("OCR Text", theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Button(
-        onClick = {
-          vibrate()
-          picker.launch("image/*")
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text(if (imageUri != null) "PHOTO SELECTED ✓" else "SELECT PHOTO", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-      }
-
-      Spacer(Modifier.height(12.dp))
-      Text("TEXT LANGUAGE", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-      Spacer(Modifier.height(6.dp))
-      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf("English", "Hindi", "Spanish").forEach { lang ->
-          Phase6Chip(lang, ocrLang == lang, theme) {
-            vibrate()
-            ocrLang = lang
-          }
-        }
-      }
-      Spacer(Modifier.height(6.dp))
-      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        listOf("French", "German").forEach { lang ->
-          Phase6Chip(lang, ocrLang == lang, theme) {
-            vibrate()
-            ocrLang = lang
-          }
-        }
-      }
-      Text("On-device recogniser reads Latin script — the language is saved with your export.", fontFamily = PixelFont, fontSize = 10.sp, color = theme.textSecondary)
-
-      if (previewBitmap != null) {
-        Spacer(Modifier.height(14.dp))
-        Text("IMAGE PREVIEW:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Image(
-          bitmap = previewBitmap!!.asImageBitmap(),
-          contentDescription = "OCR Preview",
-          modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 380.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card),
-          contentScale = ContentScale.Fit
-        )
-      }
-
-      Spacer(Modifier.height(16.dp))
-      if (isProcessing) {
-        LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Running on-device OCR...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-      }
-
-      if (extractedText.isNotBlank()) {
-        Column(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card)
-            .padding(14.dp)
-        ) {
-          Text("Recognized Text:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, color = theme.primaryDark, fontSize = 12.sp)
-          Spacer(Modifier.height(8.dp))
-          Text(extractedText, color = theme.text, fontSize = 13.sp)
-          Spacer(Modifier.height(12.dp))
-          Button(
-            onClick = {
-              vibrate()
-              val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-              cm.setPrimaryClip(ClipData.newPlainText("OCR Text", extractedText))
-              Toast.makeText(ctx, "Copied to clipboard ✓", Toast.LENGTH_SHORT).show()
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("COPY TEXT", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp)
-          }
-          Spacer(Modifier.height(8.dp))
-          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-              onClick = {
-                vibrate()
-                val f = saveTextToFile(ctx, extractedText, "OCR_${ocrLang}_${System.currentTimeMillis()}.txt")
-                launchSaveTxtFor = f
-              },
-              modifier = Modifier.weight(1f).height(48.dp),
-              colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-              shape = RoundedCornerShape(8.dp)
-            ) {
-              Text("EXPORT TXT", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 11.sp)
-            }
-            Button(
-              onClick = {
-                vibrate()
-                val out = PdfEngine.outFile(ctx, "OCR_${ocrLang}_${System.currentTimeMillis()}.pdf")
-                val ok = textToPdf(ctx, "OCR Text ($ocrLang)", extractedText, outFile = out)
-                if (ok) launchSavePdfFor = out
-                else Toast.makeText(ctx, "Failed to make PDF", Toast.LENGTH_SHORT).show()
-              },
-              modifier = Modifier.weight(1f).height(48.dp),
-              colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-              shape = RoundedCornerShape(8.dp)
-            ) {
-              Text("EXPORT PDF", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 11.sp)
-            }
-          }
-        }
-      }
-    }
-
-    SlideToAction(
-      label = "Slide to Extract Text",
-      theme = theme,
-      enabled = !isProcessing && imageUri != null,
-      onSlideComplete = {
-        vibrate()
-        runOcr()
-      }
-    )
-  }
-}
-
-// 10. PDF READER — Phase 6 extras: search text inside the PDF (search
-// field, jump to matches) + bookmarks (bookmark the current page, tap a
-// bookmark chip to jump back). Search runs the existing pdfToText OCR pass
-// over the file and finds the pages containing the query.
-@Composable
-fun PdfReaderScreen(
-  theme: ChamiTheme,
-  initialFile: File? = null,
-  onOpenTool: ((String) -> Unit)? = null,
-  onBack: () -> Unit
-) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-  // Phase 4, point 6: a file tapped in History opens straight here.
-  var pdfUri by remember { mutableStateOf<Uri?>(initialFile?.let { Uri.fromFile(it) }) }
-  var totalPages by remember { mutableStateOf(0) }
-  var currentPage by remember { mutableStateOf(0) }
-  // Phase 5: render at 2x so pages stay sharp when zoomed in.
-  var scale by remember { mutableStateOf(2.0f) }
-  var isNightMode by remember { mutableStateOf(false) }
-  var pageInput by remember { mutableStateOf("1") }
-  var currentBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var isLoadingPage by remember { mutableStateOf(false) }
-  // Pinch-to-zoom state (Drive-like): zoom is the display zoom on the
-  // already-rendered bitmap; pan moves the zoomed page. Reset on page
-  // change so a new page always starts fitted.
-  var zoom by remember { mutableStateOf(1f) }
-  var pan by remember { mutableStateOf(Offset.Zero) }
-  // Rendered page bitmaps are cached per page (in memory only) so
-  // going back a page does not re-render it.
-  val pageBitmapCache = remember { mutableStateMapOf<Int, Bitmap>() }
-  // Phase 6: search + bookmarks.
-  var searchQuery by remember { mutableStateOf("") }
-  var searchPages by remember { mutableStateOf<List<Int>>(emptyList()) }
-  var searchIndex by remember { mutableStateOf(0) }
-  var searching by remember { mutableStateOf(false) }
-  val bookmarks = remember { mutableStateListOf<Int>() }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  fun jumpToPage(page1Based: Int) {
-    if (page1Based in 1..totalPages) {
-      currentPage = page1Based - 1
-      pageInput = "$page1Based"
-    }
-  }
-
-  fun runSearch() {
-    val q = searchQuery.trim()
-    val u = pdfUri
-    if (q.isEmpty() || u == null) return
-    searching = true
-    scope.launch {
-      val all = withContext(Dispatchers.IO) { pdfToText(ctx, u) }
-      val hits = mutableListOf<Int>()
-      var current = -1
-      all.lines().forEach { line ->
-        val m = Regex("""--- Page (\d+) ---""").find(line)
-        if (m != null) {
-          current = m.groupValues[1].toIntOrNull() ?: -1
-        } else if (current > 0 && line.contains(q, ignoreCase = true)) {
-          if (!hits.contains(current)) hits.add(current)
-        }
-      }
-      searching = false
-      searchPages = hits
-      searchIndex = 0
-      if (hits.isNotEmpty()) {
-        jumpToPage(hits[0])
-      } else {
-        Toast.makeText(ctx, "No matches for \"$q\"", Toast.LENGTH_SHORT).show()
-      }
-    }
-  }
-
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    pdfUri = selected
-    if (selected != null) {
-      // New file: drop the previous PDF's cached pages, or the Reader
-      // would show PDF A's pages as PDF B's (H13). The page count is
-      // loaded on IO by LaunchedEffect(pdfUri) below — the old
-      // synchronous pageCount call blocked the main thread (H18).
-      pageBitmapCache.values.forEach { try { it.recycle() } catch (_: Exception) {} }
-      pageBitmapCache.clear()
-      currentBitmap = null
-      totalPages = 0
-      currentPage = 0
-      pageInput = "1"
-      searchPages = emptyList()
-      bookmarks.clear()
-    }
-  }
-
-  // Page count for a file opened from History (picker sets it itself).
-  LaunchedEffect(pdfUri) {
-    val u = pdfUri ?: return@LaunchedEffect
-    if (totalPages == 0) {
-      totalPages = withContext(Dispatchers.IO) { PdfEngine.pageCount(ctx, u) }
-    }
-  }
-
-  // Reset display zoom/pan whenever the page changes.
-  LaunchedEffect(currentPage) { zoom = 1f; pan = Offset.Zero }
-
-  // Free cached page bitmaps when leaving the Reader.
-  androidx.compose.runtime.DisposableEffect(Unit) {
-    onDispose {
-      pageBitmapCache.values.forEach { try { it.recycle() } catch (_: Exception) {} }
-      pageBitmapCache.clear()
-    }
-  }
-
-  LaunchedEffect(pdfUri, currentPage, scale) {
-    val u = pdfUri ?: return@LaunchedEffect
-    pageBitmapCache[currentPage]?.let { cached ->
-      currentBitmap = cached
-      isLoadingPage = false
-      return@LaunchedEffect
-    }
-    isLoadingPage = true
-    withContext(Dispatchers.IO) {
-      val bmp = PdfReader.renderPageBitmap(ctx, u, currentPage, scale)
-      withContext(Dispatchers.Main) {
-        if (bmp != null) {
-          pageBitmapCache[currentPage] = bmp
-          // Keep only the current page and its neighbours; recycle the
-          // rest so a large PDF cannot exhaust memory (H14).
-          val keep = (currentPage - 1)..(currentPage + 1)
-          val evict = pageBitmapCache.keys.filter { it !in keep }
-          for (k in evict) {
-            pageBitmapCache.remove(k)?.let { try { it.recycle() } catch (_: Exception) {} }
-          }
-        }
-        currentBitmap = bmp
-        isLoadingPage = false
-      }
-    }
-  }
-
-  ToolScreenContainer("PDF Reader", theme, onBack) {
-    if (pdfUri == null) {
-      Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("PDF Reader", fontFamily = PixelFont, fontSize = 14.sp, color = theme.text)
-        Spacer(Modifier.height(20.dp))
-        Button(
-          onClick = {
-            vibrate()
-            picker.launch("application/pdf")
-          },
-          modifier = Modifier.fillMaxWidth().height(56.dp),
-          colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-          shape = RoundedCornerShape(8.dp)
-        ) {
-          Text("OPEN PDF FILE", fontFamily = PixelFont, fontWeight = FontWeight.Black, fontSize = 14.sp, color = theme.textOnPrimary)
-        }
-      }
-    } else {
-      Column(Modifier.fillMaxSize()) {
-        // Controls row
-        Row(
-          Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(theme.card).padding(8.dp),
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Page: ", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-            OutlinedTextField(
-              value = pageInput,
-              onValueChange = {
-                pageInput = it
-                val p = it.toIntOrNull()
-                if (p != null && p in 1..totalPages) {
-                  currentPage = p - 1
-                }
-              },
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-              modifier = Modifier.width(60.dp).height(44.dp)
-            )
-            Text(" / $totalPages", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-          }
-
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(
-              onClick = {
-                vibrate()
-                zoom = (zoom - 0.25f).coerceIn(0.5f, 4f)
-                if (zoom == 1f) pan = Offset.Zero
-              },
-              colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-              shape = RoundedCornerShape(6.dp),
-              contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-            ) { Text("-", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 14.sp) }
-            Spacer(Modifier.width(4.dp))
-            Text("${(zoom * 100).toInt()}%", fontFamily = PixelFont, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = theme.text)
-            Spacer(Modifier.width(4.dp))
-            Button(
-              onClick = {
-                vibrate()
-                zoom = (zoom + 0.25f).coerceIn(0.5f, 4f)
-              },
-              colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-              shape = RoundedCornerShape(6.dp),
-              contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-            ) { Text("+", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 14.sp) }
-            Spacer(Modifier.width(4.dp))
-            Button(
-              onClick = {
-                vibrate()
-                isNightMode = !isNightMode
-              },
-              colors = ButtonDefaults.buttonColors(containerColor = if (isNightMode) theme.primaryDark else theme.primary),
-              shape = RoundedCornerShape(6.dp),
-              contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-            ) { Text(if (isNightMode) "☀️" else "🌙", fontSize = 12.sp) }
-          }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        // Phase 6: search text inside the PDF.
-        Row(
-          Modifier.fillMaxWidth(),
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-          OutlinedTextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            label = { Text("Search text in PDF…", fontFamily = PixelFont, fontSize = 10.sp) },
-            singleLine = true,
-            modifier = Modifier.weight(1f).height(52.dp),
-            shape = RoundedCornerShape(8.dp)
-          )
-          Button(
-            onClick = {
-              vibrate()
-              runSearch()
-            },
-            enabled = !searching,
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-          ) {
-            Text(if (searching) "…" else "SEARCH", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-          }
-        }
-        if (searching) {
-          Spacer(Modifier.height(4.dp))
-          Text("Searching all pages…", fontFamily = PixelFont, fontSize = 10.sp, color = theme.textSecondary)
-        } else if (searchPages.isNotEmpty()) {
-          Spacer(Modifier.height(4.dp))
-          Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-          ) {
-            Text(
-              "Found on pages: ${searchPages.joinToString(", ")}",
-              fontFamily = PixelFont, fontSize = 10.sp, color = theme.primaryDark, fontWeight = FontWeight.Bold
-            )
-            TextButton(
-              onClick = {
-                vibrate()
-                val next = (searchIndex + 1) % searchPages.size
-                searchIndex = next
-                jumpToPage(searchPages[next])
-              },
-              contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-            ) {
-              Text("NEXT MATCH →", fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = theme.primary)
-            }
-          }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        // Zoom slider (same zoom as pinch / +/- above).
-        Row(
-          Modifier.fillMaxWidth(),
-          verticalAlignment = Alignment.CenterVertically
-        ) {
-          Text("ZOOM", fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = theme.textSecondary)
-          Slider(
-            value = zoom,
-            onValueChange = {
-              zoom = it
-              if (zoom == 1f) pan = Offset.Zero
-            },
-            valueRange = 0.5f..4f,
-            modifier = Modifier.weight(1f),
-            colors = SliderDefaults.colors(thumbColor = theme.primary, activeTrackColor = theme.primary)
-          )
-          TextButton(onClick = { zoom = 1f; pan = Offset.Zero }) {
-            Text("FIT", fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = theme.primary)
-          }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        // Split / Merge / Compress from the reader (Phase 4, point 6).
-        // Those screens pick their own file in v1.2, so these buttons
-        // open the tool — pick the same file there again.
-        if (onOpenTool != null) {
-          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("SPLIT" to "split", "MERGE" to "merge", "COMPRESS" to "compress").forEach { (label, id) ->
-              OutlinedButton(
-                onClick = { vibrate(); onOpenTool(id) },
-                modifier = Modifier.weight(1f).height(40.dp),
-                shape = RoundedCornerShape(8.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-              ) {
-                Text(label, fontFamily = PixelFont, color = theme.text, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-              }
-            }
-          }
-          Spacer(Modifier.height(8.dp))
-        }
-        if (isLoadingPage) {
-          LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        }
-
-        // Page view (Phase 5, Drive-like): dark background, page fitted
-        // to the screen, pinch to zoom + drag to pan, double-tap toggles
-        // between fit (1x) and 2.5x zoom. Rendered at 2x, so zooming
-        // stays sharp; the bitmap is cached per page (see above).
-        Box(
-          Modifier
-            .weight(1f)
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color(0xFF121212)),
-          contentAlignment = Alignment.Center
-        ) {
-          currentBitmap?.let { bmp ->
-            Image(
-              bitmap = bmp.asImageBitmap(),
-              contentDescription = "Page ${currentPage + 1}",
-              modifier = Modifier
-                .fillMaxSize()
-                .padding(8.dp)
-                .graphicsLayer(
-                  scaleX = zoom,
-                  scaleY = zoom,
-                  translationX = pan.x,
-                  translationY = pan.y
-                )
-                .pointerInput(Unit) {
-                  detectTransformGestures { _, panChange, zoomChange, _ ->
-                    zoom = (zoom * zoomChange).coerceIn(0.5f, 4f)
-                    pan += panChange
-                    if (zoom == 1f) pan = Offset.Zero
-                  }
-                }
-                .pointerInput(Unit) {
-                  detectTapGestures(
-                    onDoubleTap = {
-                      if (zoom > 1f) { zoom = 1f; pan = Offset.Zero }
-                      else zoom = 2.5f
-                    }
-                  )
-                },
-              contentScale = ContentScale.Fit
-            )
-          }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        // Phase 6: bookmarks — bookmark this page, tap a chip to jump.
-        Row(
-          Modifier.fillMaxWidth(),
-          verticalAlignment = Alignment.CenterVertically,
-          horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-          OutlinedButton(
-            onClick = {
-              vibrate()
-              if (bookmarks.contains(currentPage)) bookmarks.remove(currentPage)
-              else bookmarks.add(currentPage)
-            },
-            modifier = Modifier.height(40.dp),
-            shape = RoundedCornerShape(8.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = theme.text)
-          ) {
-            Text(
-              if (bookmarks.contains(currentPage)) "★ BOOKMARKED" else "☆ BOOKMARK PAGE",
-              fontFamily = PixelFont, color = theme.text, fontSize = 10.sp, fontWeight = FontWeight.Bold
-            )
-          }
-          if (bookmarks.isNotEmpty()) {
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f)) {
-              items(bookmarks.sorted()) { b ->
-                Box(
-                  Modifier
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(theme.primary.copy(alpha = 0.15f))
-                    .border(1.dp, theme.primary, RoundedCornerShape(14.dp))
-                    .clickable {
-                      vibrate()
-                      jumpToPage(b + 1)
-                    }
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                  contentAlignment = Alignment.Center
-                ) {
-                  Text("★ ${b + 1}", fontFamily = PixelFont, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = theme.primaryDark)
-                }
-              }
-            }
-          }
-        }
-        Spacer(Modifier.height(8.dp))
-        // Jump to page: numbered chips (tap a page to open it).
-        if (totalPages > 1) {
-          LazyRow(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            modifier = Modifier.fillMaxWidth()
-          ) {
-            items((1..totalPages).toList()) { p ->
-              val isSel = p - 1 == currentPage
-              Box(
-                Modifier
-                  .size(40.dp)
-                  .clip(RoundedCornerShape(6.dp))
-                  .background(if (isSel) theme.primary else theme.card)
-                  .border(1.dp, theme.cardBorder, RoundedCornerShape(6.dp))
-                  .clickable {
-                    vibrate()
-                    currentPage = p - 1
-                    pageInput = "$p"
-                  },
-                contentAlignment = Alignment.Center
-              ) {
-                Text(
-                  "$p",
-                  fontFamily = PixelFont,
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = if (isSel) theme.textOnPrimary else theme.text
-                )
-              }
-            }
-          }
-          Spacer(Modifier.height(8.dp))
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-          Button(
-            onClick = {
-              vibrate()
-              if (currentPage > 0) {
-                currentPage--
-                pageInput = "${currentPage + 1}"
-              }
-            },
-            enabled = currentPage > 0,
-            modifier = Modifier.weight(1f).height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("← PREV", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp)
-          }
-          Spacer(Modifier.width(8.dp))
-          Button(
-            onClick = {
-              vibrate()
-              if (currentPage < totalPages - 1) {
-                currentPage++
-                pageInput = "${currentPage + 1}"
-              }
-            },
-            enabled = currentPage < totalPages - 1,
-            modifier = Modifier.weight(1f).height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("NEXT →", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp)
-          }
-        }
-      }
-    }
-  }
-}
-
-// 11. PDF TO TEXT — Slide to Extract, then save as .TXT goes through the
-// save picker + DoneScreen. Copy stays inline.
-@Composable
-fun PdfToTextScreen(theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-  var pdfUri by remember { mutableStateOf<Uri?>(null) }
-  var totalPages by remember { mutableStateOf(0) }
-  var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var isProcessing by remember { mutableStateOf(false) }
-  var extractedText by remember { mutableStateOf("") }
-
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-    }
-  }
-
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { selected ->
-    pdfUri = selected
-    extractedText = ""
-    showDone = false
-    doneFile = null
-    previewBitmap = null
-    if (selected != null) {
-      scope.launch(Dispatchers.IO) {
-        val n = PdfEngine.pageCount(ctx, selected)
-        val bmp = PdfReader.renderPageBitmap(ctx, selected, 0, 2.0f)
-        withContext(Dispatchers.Main) {
-          totalPages = n
-          previewBitmap = bmp
-        }
-      }
-    }
-  }
-
-  fun extract() {
-    val u = pdfUri ?: return
-    isProcessing = true
-    scope.launch {
-      val res = withContext(Dispatchers.IO) {
-        pdfToText(ctx, u)
-      }
-      isProcessing = false
-      extractedText = res
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, "text/plain") }
-    )
-    return
-  }
-
-  ToolScreenContainer("PDF to Text", theme, onBack) {
-    Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-      Button(
-        onClick = {
-          vibrate()
-          picker.launch("application/pdf")
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text(if (pdfUri != null) "PDF LOADED ($totalPages PAGES) ✓" else "SELECT PDF", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-      }
-
-      if (previewBitmap != null) {
-        Spacer(Modifier.height(14.dp))
-        Text("DOCUMENT PREVIEW (PAGE 1 OF $totalPages):", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 11.sp, color = theme.primaryDark)
-        Spacer(Modifier.height(6.dp))
-        Image(
-          bitmap = previewBitmap!!.asImageBitmap(),
-          contentDescription = "PDF Page 1 Preview",
-          modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 380.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card),
-          contentScale = ContentScale.Fit
-        )
-      }
-
-      Spacer(Modifier.height(16.dp))
-      if (isProcessing) {
-        LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        Spacer(Modifier.height(8.dp))
-        Text("Extracting text via page rendering & OCR...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-      }
-
-      if (extractedText.isNotBlank()) {
-        Column(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(theme.card)
-            .padding(14.dp)
-        ) {
-          Text("Extracted Content:", fontFamily = PixelFont, fontWeight = FontWeight.Bold, color = theme.primaryDark, fontSize = 12.sp)
-          Spacer(Modifier.height(8.dp))
-          Text(extractedText, color = theme.text, fontSize = 12.sp)
-          Spacer(Modifier.height(12.dp))
-          Button(
-            onClick = {
-              vibrate()
-              val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-              cm.setPrimaryClip(ClipData.newPlainText("PDF Text", extractedText))
-              Toast.makeText(ctx, "Copied all text ✓", Toast.LENGTH_SHORT).show()
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("COPY ALL TEXT", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp)
-          }
-          Spacer(Modifier.height(8.dp))
-          OutlinedButton(
-            onClick = {
-              vibrate()
-              val f = saveTextToFile(ctx, extractedText, "Extracted_${System.currentTimeMillis()}.txt")
-              launchSaveFor = f
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            shape = RoundedCornerShape(8.dp)
-          ) {
-            Text("SAVE AS .TXT FILE", fontFamily = PixelFont, color = theme.primaryDark, fontSize = 12.sp)
-          }
-        }
-      }
-    }
-
-    SlideToAction(
-      label = "Slide to Extract Text",
-      theme = theme,
-      enabled = !isProcessing && pdfUri != null,
-      onSlideComplete = {
-        vibrate()
-        extract()
-      }
-    )
-  }
-}
-
-
-// 12. PROTECT PDF — Phase 6: two modes, Protect / Unlock.
-// Protect: password + permissions (Block printing / Block copying — applied
-// by patching /P + /U in the protected file, see patchPdfPermissions).
-// Unlock: pick a protected PDF + enter its password; the password is
-// verified first, then the RC4 streams are decrypted in place (see
-// unlockProtectedPdf). Works with PDFs protected by this app (Standard
-// V1/R2); other encryption types are refused with a toast. NO ads — the
-// build runs directly after the slide.
-@Composable
-fun ProtectPdfScreen(theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-  val scope = rememberCoroutineScope()
-
-  var mode by remember { mutableStateOf("Protect") }
-
-  var selectedUri by remember { mutableStateOf<Uri?>(null) }
-  var pageCount by remember { mutableStateOf(0) }
-  var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
-  var password by remember { mutableStateOf("") }
-  var confirmPassword by remember { mutableStateOf("") }
-  var passwordVisible by remember { mutableStateOf(false) }
-  var blockPrint by remember { mutableStateOf(false) }
-  var blockCopy by remember { mutableStateOf(false) }
-
-  var unlockUri by remember { mutableStateOf<Uri?>(null) }
-  var unlockPassword by remember { mutableStateOf("") }
-  var unlockPasswordVisible by remember { mutableStateOf(false) }
-
-  var isProcessing by remember { mutableStateOf(false) }
-  var progressStatus by remember { mutableStateOf("") }
-
-  var pendingSaveFile by remember { mutableStateOf<File?>(null) }
-  var doneFile by remember { mutableStateOf<File?>(null) }
-  var showDone by remember { mutableStateOf(false) }
-  var launchSaveFor by remember { mutableStateOf<File?>(null) }
-  val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
-    val file = pendingSaveFile
-    if (uri != null && file != null) {
-      scope.launch {
-        val ok = withContext(Dispatchers.IO) { SaveLocation.copyToUri(ctx, file, uri) }
-        if (ok) {
-          doneFile = file
-          showDone = true
-        } else {
-          Toast.makeText(ctx, "Could not save to chosen folder", Toast.LENGTH_SHORT).show()
-        }
-      }
-    } else if (uri == null && file != null) {
-      Toast.makeText(ctx, "Save cancelled — file kept in Chami folder", Toast.LENGTH_SHORT).show()
-    }
-  }
-  LaunchedEffect(launchSaveFor) {
-    val f = launchSaveFor
-    if (f != null) {
-      pendingSaveFile = f
-      saveLauncher.launch(f.name)
-      launchSaveFor = null
-    }
-  }
-
-  fun vibrate() {
-    if (tm.hapticOn()) {
-      try {
-        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-      } catch (_: Exception) {}
-    }
-  }
-
-  val pdfPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-    if (uri != null) {
-      vibrate()
-      selectedUri = uri
-      showDone = false
-      doneFile = null
-      scope.launch(Dispatchers.IO) {
-        val count = PdfEngine.pageCount(ctx, uri)
-        val bmp = PdfReader.renderPageBitmap(ctx, uri, 0, 1.0f)
-        withContext(Dispatchers.Main) {
-          pageCount = count
-          previewBitmap = bmp
-        }
-      }
-    }
-  }
-
-  val unlockPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-    if (uri != null) {
-      vibrate()
-      unlockUri = uri
-      showDone = false
-      doneFile = null
-    }
-  }
-  fun protect() {
-    val uri = selectedUri ?: return
-    isProcessing = true
-    progressStatus = "Encrypting document & writing crypt keys..."
-    scope.launch(Dispatchers.IO) {
-      val out = PdfEngine.outFile(ctx, "protected_${System.currentTimeMillis()}.pdf")
-      val ok = PdfProtector.protectPdf(ctx, uri, password, out) { current, total ->
-        progressStatus = "Encrypting page $current of $total..."
-      }
-      var patched = true
-      if (ok && (blockPrint || blockCopy)) {
-        patched = patchPdfPermissions(out, password, allowPrint = !blockPrint, allowCopy = !blockCopy)
-      }
-      withContext(Dispatchers.Main) {
-        isProcessing = false
-        if (ok) {
-          if (!patched) {
-            Toast.makeText(ctx, "Protected, but permissions could not be applied", Toast.LENGTH_LONG).show()
-          } else {
-            Toast.makeText(ctx, "PDF Protected Successfully! ✓", Toast.LENGTH_SHORT).show()
-          }
-          launchSaveFor = out
-        } else {
-          Toast.makeText(ctx, "Failed to encrypt PDF", Toast.LENGTH_SHORT).show()
-        }
-      }
-    }
-  }
-
-  fun unlock() {
-    val uri = unlockUri ?: return
-    if (unlockPassword.isBlank()) {
-      Toast.makeText(ctx, "Enter the PDF password", Toast.LENGTH_SHORT).show()
-      return
-    }
-    isProcessing = true
-    scope.launch {
-      val tmp = File(ctx.cacheDir, "unlock_in_${System.currentTimeMillis()}.pdf")
-      val out = PdfEngine.outFile(ctx, "Unlocked_${System.currentTimeMillis()}.pdf")
-      val ok = withContext(Dispatchers.IO) {
-        try {
-          ctx.contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(tmp).use { o -> input.copyTo(o) }
-          }
-        } catch (_: Exception) { }
-        if (!tmp.exists()) false
-        else if (!PdfProtector.verifyPassword(tmp, unlockPassword)) false
-        else unlockProtectedPdf(tmp, unlockPassword, out)
-      }
-      isProcessing = false
-      if (ok) {
-        Toast.makeText(ctx, "Unlocked ✓", Toast.LENGTH_SHORT).show()
-        launchSaveFor = out
-      } else {
-        Toast.makeText(ctx, "Wrong password, or this file can't be unlocked on-device", Toast.LENGTH_LONG).show()
-      }
-    }
-  }
-
-  if (showDone && doneFile != null) {
-    DoneScreen(
-      file = doneFile!!,
-      theme = theme,
-      onBackHome = onBack,
-      onOpen = { ShareHelper.openFile(ctx, it, "application/pdf") }
-    )
-    return
-  }
-
-  ToolScreenContainer("Protect PDF", theme, onBack) {
-    Column(
-      Modifier
-        .fillMaxSize()
-        .verticalScroll(rememberScrollState()),
-      verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-      // Mode tabs: Protect / Unlock
-      Row(
-        modifier = Modifier
-          .fillMaxWidth()
-          .clip(RoundedCornerShape(8.dp))
-          .background(theme.card)
-          .padding(4.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
-      ) {
-        listOf("Protect", "Unlock").forEach { m ->
-          Box(
-            modifier = Modifier
-              .weight(1f)
-              .height(40.dp)
-              .clip(RoundedCornerShape(6.dp))
-              .background(if (mode == m) theme.primary else Color.Transparent)
-              .clickable {
-                vibrate()
-                mode = m
-              },
-            contentAlignment = Alignment.Center
-          ) {
-            Text(
-              m.uppercase(),
-              fontFamily = PixelFont,
-              fontWeight = FontWeight.Bold,
-              fontSize = 11.sp,
-              color = if (mode == m) Color.White else theme.text
-            )
-          }
-        }
-      }
-
-      if (mode == "Unlock") {
-        Column(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(theme.card)
-            .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-            .padding(16.dp)
-        ) {
-          Text("UNLOCK A PROTECTED PDF", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = theme.text)
-          Spacer(Modifier.height(12.dp))
-          Button(
-            onClick = {
-              vibrate()
-              unlockPicker.launch("application/pdf")
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-            shape = RoundedCornerShape(10.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder)
-          ) {
-            Text(
-              if (unlockUri == null) "CHOOSE PROTECTED PDF" else "CHANGE PDF FILE",
-              fontFamily = PixelFont,
-              color = theme.primary,
-              fontWeight = FontWeight.Bold,
-              fontSize = 12.sp
-            )
-          }
-          if (unlockUri != null) {
-            Spacer(Modifier.height(14.dp))
-            OutlinedTextField(
-              value = unlockPassword,
-              onValueChange = { unlockPassword = it },
-              label = { Text("Enter PDF Password", fontFamily = PixelFont, fontSize = 12.sp) },
-              singleLine = true,
-              visualTransformation = if (unlockPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-              trailingIcon = {
-                IconButton(onClick = { unlockPasswordVisible = !unlockPasswordVisible }) {
-                  Text(if (unlockPasswordVisible) "👁️" else "🔒", fontSize = 16.sp)
-                }
-              },
-              modifier = Modifier.fillMaxWidth(),
-              shape = RoundedCornerShape(10.dp)
-            )
-            Spacer(Modifier.height(8.dp))
-            Text("Removes the password from PDFs protected by Chami (Standard encryption).", fontFamily = PixelFont, fontSize = 11.sp, color = theme.textSecondary)
-          }
-        }
-        if (isProcessing) {
-          LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-        }
-      } else {
-        // Step 1: Select Document
-        Column(
-          Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(theme.card)
-            .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-            .padding(16.dp)
-        ) {
-          Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-              Modifier
-                .size(28.dp)
-                .clip(CircleShape)
-                .background(theme.primary.copy(alpha = 0.15f)),
-              contentAlignment = Alignment.Center
-            ) {
-              Text("1", fontFamily = PixelFont, fontWeight = FontWeight.Bold, color = theme.primary, fontSize = 13.sp)
-            }
-            Spacer(Modifier.width(10.dp))
-            Text(
-              "SELECT PDF DOCUMENT",
-              fontFamily = PixelFont,
-              fontWeight = FontWeight.Bold,
-              fontSize = 13.sp,
-              color = theme.text
-            )
-          }
-
-          Spacer(Modifier.height(12.dp))
-
-          Button(
-            onClick = {
-              vibrate()
-              pdfPicker.launch("application/pdf")
-            },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = theme.card),
-            shape = RoundedCornerShape(10.dp),
-            border = androidx.compose.foundation.BorderStroke(1.dp, theme.cardBorder)
-          ) {
-            Text(
-              if (selectedUri == null) "CHOOSE PDF FILE" else "CHANGE PDF FILE",
-              fontFamily = PixelFont,
-              color = theme.primary,
-              fontWeight = FontWeight.Bold,
-              fontSize = 12.sp
-            )
-          }
-
-          if (selectedUri != null) {
-            Spacer(Modifier.height(14.dp))
-            Row(
-              Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(theme.bg)
-                .border(1.dp, theme.cardBorder, RoundedCornerShape(12.dp))
-                .padding(10.dp),
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              if (previewBitmap != null) {
-                Image(
-                  bitmap = previewBitmap!!.asImageBitmap(),
-                  contentDescription = "Document Page 1",
-                  modifier = Modifier
-                    .size(54.dp, 72.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .border(1.dp, theme.cardBorder, RoundedCornerShape(6.dp)),
-                  contentScale = ContentScale.Crop
-                )
-              } else {
-                Box(
-                  Modifier
-                    .size(54.dp, 72.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(theme.card),
-                  contentAlignment = Alignment.Center
-                ) {
-                  Text("📄", fontSize = 24.sp)
-                }
-              }
-              Spacer(Modifier.width(12.dp))
-              Column(Modifier.weight(1f)) {
-                Text(
-                  "Document Selected",
-                  fontFamily = PixelFont,
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 13.sp,
-                  color = theme.text
-                )
-                Spacer(Modifier.height(3.dp))
-                Text(
-                  "Total Pages: $pageCount",
-                  fontFamily = PixelFont,
-                  fontSize = 11.sp,
-                  color = theme.textSecondary
-                )
-              }
-            }
-          }
-        }
-
-        // Step 2: Password Security Setup
-        if (selectedUri != null) {
-          Column(
-            Modifier
-              .fillMaxWidth()
-              .clip(RoundedCornerShape(16.dp))
-              .background(theme.card)
-              .border(1.dp, theme.cardBorder, RoundedCornerShape(16.dp))
-              .padding(16.dp)
-          ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                Modifier
-                  .size(28.dp)
-                  .clip(CircleShape)
-                  .background(theme.primary.copy(alpha = 0.15f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Text("2", fontFamily = PixelFont, fontWeight = FontWeight.Bold, color = theme.primary, fontSize = 13.sp)
-              }
-              Spacer(Modifier.width(10.dp))
-              Text(
-                "SET ENCRYPTION PASSWORD",
-                fontFamily = PixelFont,
-                fontWeight = FontWeight.Bold,
-                fontSize = 13.sp,
-                color = theme.text
-              )
-            }
-
-            Spacer(Modifier.height(14.dp))
-
-            OutlinedTextField(
-              value = password,
-              onValueChange = { password = it },
-              label = { Text("Enter Document Password", fontFamily = PixelFont, fontSize = 12.sp) },
-              singleLine = true,
-              visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-              trailingIcon = {
-                IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                  Text(if (passwordVisible) "👁️" else "🔒", fontSize = 16.sp)
-                }
-              },
-              modifier = Modifier.fillMaxWidth(),
-              shape = RoundedCornerShape(10.dp)
-            )
-
-            Spacer(Modifier.height(10.dp))
-
-            OutlinedTextField(
-              value = confirmPassword,
-              onValueChange = { confirmPassword = it },
-              label = { Text("Confirm Document Password", fontFamily = PixelFont, fontSize = 12.sp) },
-              singleLine = true,
-              visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-              keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-              modifier = Modifier.fillMaxWidth(),
-              shape = RoundedCornerShape(10.dp),
-              isError = confirmPassword.isNotEmpty() && password != confirmPassword
-            )
-
-            if (confirmPassword.isNotEmpty() && password != confirmPassword) {
-              Spacer(Modifier.height(4.dp))
-              Text(
-                "Passwords do not match",
-                fontFamily = PixelFont,
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.error
-              )
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            val strength = when {
-              password.isEmpty() -> ""
-              password.length < 5 -> "Weak"
-              password.length < 8 -> "Moderate"
-              password.any { it.isDigit() } && password.any { it.isLetter() } -> "Strong 🛡️"
-              else -> "Good"
-            }
-
-            if (password.isNotEmpty()) {
-              Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Security: ", fontFamily = PixelFont, fontSize = 11.sp, color = theme.textSecondary)
-                Text(
-                  strength,
-                  fontFamily = PixelFont,
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 11.sp,
-                  color = if (strength.startsWith("Weak")) MaterialTheme.colorScheme.error else theme.primary
-                )
-              }
-              Spacer(Modifier.height(12.dp))
-            }
-
-            // Step 3: Permissions
-            Text("PERMISSIONS", fontFamily = PixelFont, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = theme.text)
-            Spacer(Modifier.height(6.dp))
-            Row(
-              Modifier.fillMaxWidth().clickable {
-                vibrate()
-                blockPrint = !blockPrint
-              },
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              Checkbox(
-                checked = blockPrint,
-                onCheckedChange = { blockPrint = it },
-                colors = CheckboxDefaults.colors(checkedColor = theme.primary)
-              )
-              Text("Block printing", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-            }
-            Row(
-              Modifier.fillMaxWidth().clickable {
-                vibrate()
-                blockCopy = !blockCopy
-              },
-              verticalAlignment = Alignment.CenterVertically
-            ) {
-              Checkbox(
-                checked = blockCopy,
-                onCheckedChange = { blockCopy = it },
-                colors = CheckboxDefaults.colors(checkedColor = theme.primary)
-              )
-              Text("Block copying text", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text)
-            }
-          }
-        }
-
-        if (isProcessing) {
-          LinearProgressIndicator(Modifier.fillMaxWidth(), color = theme.primary)
-          Spacer(Modifier.height(4.dp))
-          Text(if (progressStatus.isNotEmpty()) progressStatus else "Encrypting...", fontFamily = PixelFont, fontSize = 11.sp, color = theme.text)
-        }
-      }
-    }
-
-    if (mode == "Unlock") {
-      SlideToAction(
-        label = "Slide to Unlock PDF",
-        theme = theme,
-        enabled = !isProcessing && unlockUri != null && unlockPassword.isNotBlank(),
-        onSlideComplete = {
-          vibrate()
-          unlock()
-        }
-      )
-    } else {
-      val canEncrypt = password.isNotBlank() && password == confirmPassword && !isProcessing
-      SlideToAction(
-        label = "Slide to Protect PDF",
-        theme = theme,
-        enabled = selectedUri != null && canEncrypt,
-        onSlideComplete = {
-          vibrate()
-          protect()
-        }
-      )
-    }
-  }
-}
-
-// Placeholder for future tools
-@Composable
-fun FutureToolPlaceholderScreen(toolName: String, theme: ChamiTheme, onBack: () -> Unit) {
-  val ctx = LocalContext.current
-  val haptic = LocalHapticFeedback.current
-  val tm = remember { ThemeManager(ctx) }
-
-  ToolScreenContainer(toolName, theme, onBack) {
-    Column(
-      Modifier.fillMaxSize(),
-      verticalArrangement = Arrangement.Center,
-      horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-      Text(toolName, fontFamily = PixelFont, fontWeight = FontWeight.Black, fontSize = 20.sp, color = theme.primaryDark)
-      Spacer(Modifier.height(12.dp))
-      Text("Tool Coming Soon", fontFamily = PixelFont, fontSize = 14.sp, color = theme.text)
-      Spacer(Modifier.height(8.dp))
-      Text("This utility is currently in development.", fontFamily = PixelFont, fontSize = 12.sp, color = theme.text.copy(alpha = 0.7f))
-      Spacer(Modifier.height(24.dp))
-      Button(
-        onClick = {
-          if (tm.hapticOn()) {
-            try { haptic.performHapticFeedback(HapticFeedbackType.LongPress) } catch (_: Exception) {}
-          }
-          onBack()
-        },
-        modifier = Modifier.fillMaxWidth().height(48.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
-        shape = RoundedCornerShape(8.dp)
-      ) {
-        Text("RETURN HOME", fontFamily = PixelFont, color = theme.textOnPrimary, fontSize = 12.sp)
-      }
-    }
-  }
-}
+// 5. MERGE PDF — drag reorder of file rows (long-press lifts, others
+// slide aside, drop at half-row height, haptic on pickup; arrow buttons
+// stay as the accessibility alternative) + per-file preview, page count
+// and size. NOTE: PdfEngine.copyPages renders every source page to a
+// bitmap, so selectable text, links and vector quality are lost in the
+// merged file — the output is pictures of the pages.
